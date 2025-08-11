@@ -2,6 +2,8 @@ module github.com/ligun0805/bundle-rescue
 
 go 1.22
 
+toolchain go1.24.3
+
 require (
 	fyne.io/fyne/v2 v2.5.1
 	github.com/ethereum/go-ethereum v1.14.11
