@@ -6,437 +6,549 @@ import (
 	"crypto/ecdsa"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
-	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/crypto"
+	gethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
-)
 
-// ---------- Public API ----------
+	"github.com/lmittmann/flashbots"
+	w3 "github.com/lmittmann/w3"
+)
 
 type Params struct {
 	RPC         string
 	ChainID     *big.Int
 	Relays      []string
 	AuthPrivHex string
+	Logf        func(string, ...any)
+	OnSimResult func(relay, raw string, ok bool, err string)
 
 	Token     common.Address
 	From      common.Address
 	To        common.Address
 	AmountWei *big.Int
 
-	SafePKHex string // funding wallet (sends ETH to From)
-	FromPKHex string // compromised wallet
+	SafePKHex string
+	FromPKHex string
 
-	Blocks      int
-	TipGweiBase int64
-	TipMul      float64
-	BaseMul     int64
-	BufferPct   int64
-
+	Blocks       int
+	TipGweiBase  int64
+	TipMul       float64
+	BaseMul      int64
+	BufferPct    int64
 	SimulateOnly bool
-
-	Logf        func(format string, a ...any)
-	OnSimResult func(relayURL string, rawJSON string, ok bool, err string)
+	SkipIfPaused bool
 }
 
-type Output struct {
-	Reason   string
+type Result struct {
 	Included bool
+	Reason   string
 }
 
-// ---------- Flashbots client ----------
+func (p *Params) logf(format string, a ...any) { if p.Logf != nil { p.Logf(format, a...) } }
 
-type flashClient struct {
-	url     string
-	authPK  *ecdsa.PrivateKey
-	address common.Address
-	httpc   *http.Client
+func hexToECDSAPriv(s string) (*ecdsa.PrivateKey, error) {
+	h := strings.TrimSpace(strings.TrimPrefix(s, "0x"))
+	if len(h) == 0 { return nil, errors.New("empty private key") }
+	return gethcrypto.HexToECDSA(h)
+}
+func gweiToWei(g int64) *big.Int { x:= new(big.Int).SetInt64(g); return x.Mul(x, big.NewInt(1_000_000_000)) }
+func mulBig(a *big.Int, m int64) *big.Int { if a==nil { return big.NewInt(0) }; return new(big.Int).Mul(a, big.NewInt(m)) }
+func addBig(a, b *big.Int) *big.Int { if a==nil { return b }; if b==nil { return a }; return new(big.Int).Add(a, b) }
+
+// --- pretty format helpers ---
+func fmtETH(x *big.Int) string {
+	if x == nil { return "0" }
+	// x / 1e18 -> 6 знаков после запятой
+	r := new(big.Rat).SetFrac(new(big.Int).Set(x), big.NewInt(1_000_000_000_000_000_000))
+	return r.FloatString(6) // ETH
+}
+func fmtGwei(x *big.Int) string {
+	if x == nil { return "0" }
+	r := new(big.Rat).SetFrac(new(big.Int).Set(x), big.NewInt(1_000_000_000))
+	return r.FloatString(2) // gwei
 }
 
-func newFlashClient(url, authPrivHex string) (*flashClient, error) {
-	h := strings.TrimPrefix(strings.TrimSpace(authPrivHex), "0x")
-	if h == "" {
-		return nil, fmt.Errorf("auth private key is empty")
-	}
-	pk, err := crypto.HexToECDSA(h)
-	if err != nil {
-		return nil, fmt.Errorf("auth pk parse: %w", err)
-	}
-	addr := crypto.PubkeyToAddress(pk.PublicKey)
-	return &flashClient{
-		url:     strings.TrimSpace(url),
-		authPK:  pk,
-		address: addr,
-		httpc:   &http.Client{Timeout: 12 * time.Second},
-	}, nil
+
+func encodeERC20Transfer(to common.Address, amount *big.Int) []byte {
+	selector := common.FromHex("0xa9059cbb")
+	arg1 := common.LeftPadBytes(to.Bytes(), 32)
+	arg2 := common.LeftPadBytes(amount.Bytes(), 32)
+	return append(selector, append(arg1, arg2...)...)
 }
 
-func (c *flashClient) signBody(b []byte) string {
-	hash := crypto.Keccak256(b)
-	sig, err := crypto.Sign(hash, c.authPK)
-	if err != nil {
-		return ""
+// PreflightTransfer делает «сухой прогон» transfer(from->to, amount) через eth_estimateGas/eth_call.
+// Возвращает ok=true, если вызов проходит без ревёрта; иначе ok=false и reason (если удалось извлечь).
+func PreflightTransfer(ctx context.Context, ec *ethclient.Client, token, from, to common.Address, amount *big.Int) (ok bool, reason string, err error) {
+	data := encodeERC20Transfer(to, amount)
+	msg  := ethereum.CallMsg{ From: from, To: &token, Data: data, Value: big.NewInt(0) }
+	if _, e := ec.EstimateGas(ctx, msg); e == nil {
+		return true, "", nil
 	}
-	return c.address.Hex() + ":" + "0x" + hex.EncodeToString(sig)
+	// Попробуем вытащить reason через CallContract
+	if _, e := ec.CallContract(ctx, msg, nil); e != nil {
+		return false, revertReason(e), nil
+	}
+	return false, "transfer would revert", nil
 }
 
-func (c *flashClient) rpc(ctx context.Context, method string, params any) (status int, body []byte, err error) {
-	payload := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  method,
-		"params":  params,
+func revertReason(e error) string {
+	s := e.Error()
+	if i := strings.Index(s, "execution reverted"); i >= 0 {
+		return s[i:]
 	}
-	b, _ := json.Marshal(payload)
-	req, _ := http.NewRequestWithContext(ctx, "POST", c.url, bytes.NewReader(b))
+	return s
+}
+
+
+var pausedSigs = [][]byte{
+	common.FromHex("0x5c975abb"), // paused()
+	common.FromHex("0x3f4ba83a"), // isPaused()
+	common.FromHex("0x51dff989"), // transfersPaused()
+	common.FromHex("0x5c701d2f"), // tradingPaused()
+	common.FromHex("0x8462151c"), // isTradingPaused()
+	common.FromHex("0x2e1a7d4d"), // pausedTransfers()
+	common.FromHex("0x0b3bafd6"), // globalPaused()
+	common.FromHex("0x9c6a3b7c"), // transferEnabled()
+	common.FromHex("0x75f12b21"), // isTransferEnabled()
+	common.FromHex("0x4f2be91f"), // tradingEnabled()
+	common.FromHex("0x0dfe1681"), // isTradingEnabled()
+}
+
+// CheckPaused проверяет распространённые варианты «паузы» токена (paused/isPaused/...).
+// Возвращает: known=true, paused=true/false — если нашли одну из сигнатур; known=false — если определить не удалось.
+func CheckPaused(ctx context.Context, ec *ethclient.Client, token common.Address) (known, paused bool, err error) {
+	for _, sig := range pausedSigs {
+		res, e := ec.CallContract(ctx, ethereum.CallMsg{To:&token, Data:sig}, nil)
+		if e != nil || len(res) == 0 { continue }
+		b := res[len(res)-1]
+		s := hex.EncodeToString(sig)
+		if strings.Contains(s, "enabled") {
+			return true, b == 0, nil
+		}
+		return true, b == 1, nil
+	}
+	return false, false, nil
+}
+
+func estimateTransferGas(ctx context.Context, ec *ethclient.Client, from common.Address, token common.Address, data []byte) (uint64, error) {
+	msg := ethereum.CallMsg{ From: from, To:&token, Value:big.NewInt(0), Data:data }
+	return ec.EstimateGas(ctx, msg)
+}
+
+func latestBaseFee(ctx context.Context, ec *ethclient.Client) (*big.Int, *big.Int, error) {
+	h, err := ec.HeaderByNumber(ctx, nil)
+	if err != nil { return nil, nil, err }
+	if h.BaseFee == nil { return nil, h.Number, errors.New("no baseFee (pre-1559?)") }
+	return new(big.Int).Set(h.BaseFee), new(big.Int).Set(h.Number), nil
+}
+
+
+// nextBaseFeeViaFeeHistory fetches baseFee for the *next* block using eth_feeHistory.
+func nextBaseFeeViaFeeHistory(ctx context.Context, rpcURL string) (*big.Int, error) {
+	type feeHistResp struct {
+		Jsonrpc string          `json:"jsonrpc"`
+		ID      int             `json:"id"`
+		Result  struct {
+			BaseFeePerGas []string `json:"baseFeePerGas"`
+		} `json:"result"`
+		Error *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error,omitempty"`
+	}
+	body, _ := json.Marshal(rpcReq{ Jsonrpc:"2.0", Method:"eth_feeHistory", Params: []any{ "0x1", "pending", []int{50} }, ID:1 })
+	req, _ := http.NewRequestWithContext(ctx, "POST", rpcURL, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Flashbots-Signature", c.signBody(b))
-	resp, err := c.httpc.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { return nil, err }
 	defer resp.Body.Close()
-	all := new(bytes.Buffer)
-	_, _ = all.ReadFrom(resp.Body)
-	return resp.StatusCode, all.Bytes(), nil
+	var out feeHistResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil { return nil, err }
+	if out.Error != nil { return nil, errors.New(out.Error.Message) }
+	if len(out.Result.BaseFeePerGas) < 2 { return nil, errors.New("feeHistory: short baseFee array") }
+	// last element is the *next* block base fee
+	bf, ok := new(big.Int).SetString(strings.TrimPrefix(out.Result.BaseFeePerGas[len(out.Result.BaseFeePerGas)-1], "0x"), 16)
+	if !ok { return nil, errors.New("feeHistory: parse baseFee") }
+	return bf, nil
 }
 
-type simResponse struct {
-	OK      bool
-	RawJSON string
-	Error   string
+// suggestPriorityViaRPC fetches eth_maxPriorityFeePerGas; returns nil if not supported.
+func suggestPriorityViaRPC(ctx context.Context, rpcURL string) *big.Int {
+	type respT struct {
+		Jsonrpc string          `json:"jsonrpc"`
+		ID      int             `json:"id"`
+		Result  string          `json:"result"`
+		Error   *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error,omitempty"`
+	}
+	body, _ := json.Marshal(rpcReq{ Jsonrpc:"2.0", Method:"eth_maxPriorityFeePerGas", Params: []any{}, ID:1 })
+	req, _ := http.NewRequestWithContext(ctx, "POST", rpcURL, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { return nil }
+	defer resp.Body.Close()
+	var out respT
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil { return nil }
+	if out.Error != nil || out.Result == "" { return nil }
+	val, ok := new(big.Int).SetString(strings.TrimPrefix(out.Result, "0x"), 16)
+	if !ok { return nil }
+	return val
+}
+func txAsHex(tx *types.Transaction) string { b,_ := tx.MarshalBinary(); return "0x" + hex.EncodeToString(b) }
+
+func buildDynamicTx(chain *big.Int, nonce uint64, to *common.Address, value *big.Int, gasLimit uint64, tip, feeCap *big.Int, data []byte) *types.Transaction {
+	df := &types.DynamicFeeTx{
+		ChainID: chain, Nonce: nonce, Gas: gasLimit, GasTipCap: new(big.Int).Set(tip), GasFeeCap: new(big.Int).Set(feeCap),
+		To: to, Value: new(big.Int).Set(value), Data: data,
+	}
+	return types.NewTx(df)
 }
 
-func (c *flashClient) callBundle(ctx context.Context, txs []string, target uint64, stateTag string) (*simResponse, error) {
-	params := []any{
-		map[string]any{
-			"txs":              txs,
-			"blockNumber":      hexutil.EncodeUint64(target),
-			"stateBlockNumber": stateTag, // "latest"
-		},
-	}
-	code, body, err := c.rpc(ctx, "eth_callBundle", params)
-	raw := string(body)
-	if err != nil {
-		return &simResponse{OK: false, RawJSON: raw, Error: err.Error()}, err
-	}
-	if code != 200 {
-		return &simResponse{OK: false, RawJSON: raw, Error: fmt.Sprintf("http %d", code)}, fmt.Errorf("http %d", code)
-	}
-	// If RPC error field present -> fail
-	var wrap struct {
-		Error any `json:"error"`
-	}
-	_ = json.Unmarshal(body, &wrap)
-	if wrap.Error != nil {
-		return &simResponse{OK: false, RawJSON: raw, Error: "rpc error"}, nil
-	}
-	return &simResponse{OK: true, RawJSON: raw, Error: ""}, nil
+func signTx(tx *types.Transaction, chain *big.Int, prv *ecdsa.PrivateKey) (*types.Transaction, error) {
+	signer := types.LatestSignerForChainID(chain)
+	return types.SignTx(tx, signer, prv)
 }
 
-func (c *flashClient) sendBundle(ctx context.Context, txs []string, target uint64) (int, []byte, error) {
-	params := []any{
-		map[string]any{
-			"txs":         txs,
-			"blockNumber": hexutil.EncodeUint64(target),
-		},
-	}
-	return c.rpc(ctx, "eth_sendBundle", params)
+type rpcReq struct {
+	Jsonrpc string      `json:"jsonrpc"`
+	Method  string      `json:"method"`
+	Params  interface{} `json:"params"`
+	ID      int         `json:"id"`
+}
+type rpcResp struct {
+	Jsonrpc string          `json:"jsonrpc"`
+	ID      int             `json:"id"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    any    `json:"data,omitempty"`
+	} `json:"error,omitempty"`
 }
 
-// ---------- Builder ----------
+func sendMevBundle(ctx context.Context, url string, authPriv *ecdsa.PrivateKey, txHexes []string, targetBlock *big.Int) (string, error) {
+	payload := map[string]any{
+		"txs": txHexes,
+		"blockNumber": fmt.Sprintf("0x%x", targetBlock),
+	}
+	params := []any{ payload }
+	body, _ := json.Marshal(rpcReq{ Jsonrpc:"2.0", Method:"mev_sendBundle", Params: params, ID:1 })
 
-var erc20ABI abi.ABI
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if authPriv != nil {
+		addr := gethcrypto.PubkeyToAddress(authPriv.PublicKey)
+		sig := gethcrypto.Keccak256Hash(body).Hex()
+		req.Header.Set("X-Flashbots-Signature", addr.Hex()+":"+sig)
+	}
 
-func init() {
-	const erc20 = `[{"inputs":[{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"transfer","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"}]`
-	ab, _ := abi.JSON(strings.NewReader(erc20))
-	erc20ABI = ab
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { return "", err }
+	defer resp.Body.Close()
+	var out rpcResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil { return "", err }
+	if out.Error != nil { return "", errors.New(out.Error.Message) }
+	return string(out.Result), nil
 }
 
-func powf(x float64, y int) float64 { return math.Exp(math.Log(x) * float64(y)) }
-
-// Run builds a (fund + token) bundle, simulates and optionally sends it, with retries over blocks.
-func Run(ctx context.Context, ec *ethclient.Client, p Params) (*Output, error) {
-	logf := func(s string, a ...any) {
-		if p.Logf != nil {
-			p.Logf(s, a...)
-		}
-	}
-
-	if p.AmountWei == nil || p.AmountWei.Sign() <= 0 {
-		return nil, fmt.Errorf("amount is zero")
-	}
-	if len(p.Relays) == 0 {
-		return nil, fmt.Errorf("no relays configured")
-	}
+func Run(ctx context.Context, ec *ethclient.Client, p Params) (Result, error) {
+	if p.AmountWei == nil || p.AmountWei.Sign() <= 0 { return Result{}, errors.New("AmountWei must be > 0") }
 	if p.ChainID == nil {
-		return nil, fmt.Errorf("chainID is nil")
+		chainID, err := ec.ChainID(ctx); if err != nil { return Result{}, fmt.Errorf("chain id: %w", err) }
+		p.ChainID = chainID
 	}
+	safePrv, err := hexToECDSAPriv(p.SafePKHex); if err != nil { return Result{}, fmt.Errorf("safe pk: %w", err) }
+	fromPrv, err := hexToECDSAPriv(p.FromPKHex); if err != nil { return Result{}, fmt.Errorf("from pk: %w", err) }
+	authPrv, err := hexToECDSAPriv(p.AuthPrivHex); if err != nil { return Result{}, fmt.Errorf("auth pk: %w", err) }
 
-	if ec == nil {
-		var err error
-		ec, err = ethclient.Dial(p.RPC)
-		if err != nil {
-			return nil, fmt.Errorf("dial rpc: %w", err)
+	if p.SkipIfPaused {
+		if known, paused, _ := CheckPaused(ctx, ec, p.Token); known && paused {
+			p.logf("[pre-check] token is paused => skip")
+			return Result{Included:false, Reason:"token paused"}, nil
 		}
 	}
 
-	logf("prepare: token=%s from=%s to=%s amountWei=%s", p.Token.Hex(), p.From.Hex(), p.To.Hex(), p.AmountWei.String())
-
-	// Keys
-	safePK, err := crypto.HexToECDSA(strings.TrimPrefix(p.SafePKHex, "0x"))
-	if err != nil {
-		return nil, fmt.Errorf("safe pk: %w", err)
-	}
-	fromPK, err := crypto.HexToECDSA(strings.TrimPrefix(p.FromPKHex, "0x"))
-	if err != nil {
-		return nil, fmt.Errorf("from pk: %w", err)
-	}
-	safeAddr := crypto.PubkeyToAddress(safePK.PublicKey)
-
-	// Nonces
-	safeNonce, err := ec.PendingNonceAt(ctx, safeAddr)
-	if err != nil {
-		return nil, fmt.Errorf("nonce(safe): %w", err)
-	}
-	fromNonce, err := ec.PendingNonceAt(ctx, p.From)
-	if err != nil {
-		return nil, fmt.Errorf("nonce(from): %w", err)
-	}
-
-	// Head / target
-	logf("fetch head...")
-	head, err := ec.HeaderByNumber(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("head: %w", err)
-	}
-	baseFee := head.BaseFee
-	if baseFee == nil {
-		baseFee = big.NewInt(0)
-	}
-	logf("head=%d baseFee=%s", head.Number.Uint64(), baseFee.String())
-	target0 := new(big.Int).Add(head.Number, big.NewInt(1)).Uint64()
-
-	// Data for token transfer (from -> to)
-	data, err := erc20ABI.Pack("transfer", p.To, p.AmountWei)
-	if err != nil {
-		return nil, fmt.Errorf("erc20 pack: %w", err)
-	}
-
-	// Estimate gas for token tx
-	logf("estimating gas for ERC20.transfer...")
-	est, err := ec.EstimateGas(ctx, ethereum.CallMsg{
-		From: p.From,
-		To:   &p.Token,
-		Data: data,
-	})
-	if err != nil {
-		// fallback constant
-		logf("estimateGas failed (%v), fallback to 70000", err)
-		est = 70000
-	}
-	// add buffer
-	logf("gasEstimate=%d bufferPct=%d", est, p.BufferPct)
-	estPlus := uint64(float64(est) * (1.0 + float64(p.BufferPct)/100.0))
-
-	// Strategy
-	baseMul := big.NewInt(p.BaseMul)
-	blocksForward := p.Blocks
-	if blocksForward <= 0 {
-		blocksForward = 5
-	}
-	tipBase := p.TipGweiBase
-	if tipBase <= 0 {
-		tipBase = 2
-	}
-	tipMul := p.TipMul
-	if tipMul < 1.0 {
-		tipMul = 1.25
-	}
-	logf("strategy: blocks=%d tipBaseGwei=%d tipMul=%.2f baseMul=%d", blocksForward, tipBase, tipMul, p.BaseMul)
-
-	// Helper to build signed txs & raw
-	makeBundle := func(tipGwei int64) (fundTx *types.Transaction, tokenTx *types.Transaction, fundRaw, tokenRaw string, err error) {
-		// dynamic fees
-		tip := new(big.Int).Mul(big.NewInt(tipGwei), big.NewInt(1_000_000_000))
-		feeCap := new(big.Int).Mul(baseFee, baseMul)
-		feeCap.Add(feeCap, tip)
-
-		// FUND: safe -> From (value enough for token gas)
-		logf("fees: tipGwei=%d feeCap=%s tip=%s", tipGwei, feeCap.String(), tip.String())
-		needWei := new(big.Int).Mul(new(big.Int).SetUint64(estPlus), feeCap)
-		needWei.Add(needWei, new(big.Int).Mul(new(big.Int).SetUint64(estPlus), tip))
-		needWei.Add(needWei, new(big.Int).Mul(big.NewInt(21_000), feeCap)) // safety top-up
-		logf("estPlus=%d fundValueWei=%s", estPlus, needWei.String())
-
-		fund := &types.DynamicFeeTx{
-			ChainID:   p.ChainID,
-			Nonce:     safeNonce,
-			GasTipCap: tip,
-			GasFeeCap: feeCap,
-			Gas:       21000,
-			To:        &p.From,
-			Value:     needWei,
-			Data:      nil,
+	type relayClient struct { URL string; C *w3.Client }
+	var classic []relayClient
+	var matchmakers []string
+	for _, r := range p.Relays {
+		u := strings.TrimSpace(r); if u=="" { continue }
+		if strings.Contains(strings.ToLower(u), "mev") || strings.Contains(strings.ToLower(u), "matchmaker") {
+			matchmakers = append(matchmakers, u)
+		} else {
+			classic = append(classic, relayClient{URL: u, C: flashbots.MustDial(u, authPrv)})
 		}
-		token := &types.DynamicFeeTx{
-			ChainID:   p.ChainID,
-			Nonce:     fromNonce,
-			GasTipCap: tip,
-			GasFeeCap: feeCap,
-			Gas:       estPlus,
-			To:        &p.Token,
-			Value:     big.NewInt(0),
-			Data:      data,
-		}
-		stx1, err := types.SignNewTx(safePK, types.LatestSignerForChainID(p.ChainID), fund)
-		if err != nil {
-			return nil, nil, "", "", err
-		}
-		stx2, err := types.SignNewTx(fromPK, types.LatestSignerForChainID(p.ChainID), token)
-		if err != nil {
-			return nil, nil, "", "", err
-		}
-		br1, _ := stx1.MarshalBinary()
-		br2, _ := stx2.MarshalBinary()
-		return stx1, stx2, "0x" + hex.EncodeToString(br1), "0x" + hex.EncodeToString(br2), nil
 	}
+	if len(classic) == 0 && len(matchmakers) == 0 {
+		return Result{}, errors.New("no relays or matchmakers configured")
+	}
+	if p.Blocks <= 0 { p.Blocks = 6 }
+	if p.TipGweiBase <= 0 { p.TipGweiBase = 3 }
+	if p.TipMul <= 0 { p.TipMul = 1.2 }
+	if p.BaseMul <= 0 { p.BaseMul = 2 }
+	if p.BufferPct < 0 { p.BufferPct = 0 }
 
-	// Init relays
-	var rels []*flashClient
-	for _, u := range p.Relays {
-		u = strings.TrimSpace(u)
-		if u == "" {
+	startFromNonce, err := ec.PendingNonceAt(ctx, p.From); if err != nil { return Result{}, fmt.Errorf("nonce(from): %w", err) }
+
+	
+for attempt := 0; attempt < p.Blocks; attempt++ {
+	// Predict next block baseFee via feeHistory (fallback to latestBaseFee)
+	var baseFee *big.Int
+	var headNum *big.Int
+	if bf, err := nextBaseFeeViaFeeHistory(ctx, p.RPC); err == nil {
+		baseFee = bf
+		h, _ := ec.HeaderByNumber(ctx, nil); if h != nil && h.Number != nil { headNum = new(big.Int).Set(h.Number) } else { headNum = big.NewInt(0) }
+	} else {
+		var err2 error
+		baseFee, headNum, err2 = latestBaseFee(ctx, ec); if err2 != nil { return Result{}, fmt.Errorf("basefee: %w", err2) }
+	}
+	targetBlock := new(big.Int).Add(headNum, big.NewInt(1+int64(attempt)))
+
+	// Nonce & replace-mode detection
+	latestNonce, _ := ec.NonceAt(ctx, p.From, nil)
+	pendingNonce, _ := ec.PendingNonceAt(ctx, p.From)
+	replaceMode := pendingNonce > latestNonce // there is a pending tx at 'latestNonce'
+	fromNonce := latestNonce
+	if !replaceMode { fromNonce = pendingNonce }
+
+	// Competing-nonce abort if nonce already advanced by external inclusion
+	if pendingNonce > fromNonce && !replaceMode {
+		p.logf("[abort] competing nonce detected (start=%d now=%d)", fromNonce, pendingNonce)
+		return Result{Included:false, Reason:"competing nonce"}, nil
+	}
+	
+	// === Nonce SAFE-кошелька (tx1: SAFE -> FROM) ===
+	safeAddr := gethcrypto.PubkeyToAddress(safePrv.PublicKey)
+	safeNonce, err := ec.PendingNonceAt(ctx, safeAddr); if err != nil { return Result{}, fmt.Errorf("nonce(safe): %w", err) }
+	// Полезно видеть баланс SAFE заранее (чтобы понимать, хватит ли на prefund+газ)
+	safeBal, _ := ec.BalanceAt(ctx, safeAddr, nil)
+	p.logf("[balance] SAFE=%s ETH", fmtETH(safeBal))	
+
+
+	// Dynamic priority tip: use eth_maxPriorityFeePerGas as floor, then scale per attempt
+	suggest := suggestPriorityViaRPC(ctx, p.RPC)
+	baseTipGwei := float64(p.TipGweiBase)
+	if suggest != nil {
+		// convert wei->gwei
+		g := new(big.Int).Div(suggest, big.NewInt(1_000_000_000)).Int64()
+		if float64(g) > baseTipGwei { baseTipGwei = float64(g) }
+	}
+	tipGweiScaled := int64(math.Round(baseTipGwei * math.Pow(p.TipMul, float64(attempt))))
+	if tipGweiScaled < 1 { tipGweiScaled = p.TipGweiBase }
+	tip := gweiToWei(tipGweiScaled)
+	maxFee := addBig(mulBig(baseFee, p.BaseMul), tip)
+// Gas & total cost (with optional replace-mode 21000 cancel tx)
+// Clamp amount to balance if requested or if simulation likely to fail
+// Query balanceOf(from)
+{
+    // balanceOf(address) selector: keccak256("balanceOf(address)")[:4] = 0x70a08231
+    sel := gethcrypto.Keccak256([]byte("balanceOf(address)"))[:4]
+    data := append(sel, common.LeftPadBytes(p.From.Bytes(), 32)...)
+
+    callCtx, cancelCall := context.WithTimeout(ctx, 10*time.Second)
+    defer cancelCall()
+
+    balBytes, err := ec.CallContract(callCtx, ethereum.CallMsg{
+        To:   &p.Token,
+        Data: data,
+    }, nil)
+    if err == nil && len(balBytes) >= 32 {
+        bal := new(big.Int).SetBytes(balBytes[len(balBytes)-32:]) // берем последние 32 байта
+        if bal.Cmp(p.AmountWei) < 0 {
+            p.logf("[warn] amount > balance: clamp %s -> %s",
+                p.AmountWei.String(), bal.String())
+            p.AmountWei = bal
+        }
+    }
+}
+	calldata := encodeERC20Transfer(p.To, new(big.Int).Set(p.AmountWei))
+	gasTransfer := uint64(90000) // безопасный запас
+    if est, err := ec.EstimateGas(ctx, ethereum.CallMsg{
+        From: p.From, To: &p.Token, Data: calldata,
+    }); err == nil && est > 0 {
+        gasTransfer = est
+    } else {
+        p.logf("[warn] estimateGas for transfer failed (%v) — fallback gas=%d", err, gasTransfer)
+    }
+    cancelGas := uint64(0)
+    if replaceMode { cancelGas = 21000 }
+
+    // 3) pre-fund value: сколько надо перевести на FROM, чтобы прошёл tx2 при проверке баланса (balance >= value + gasLimit*maxFee)
+    prefundWei := new(big.Int).Mul(new(big.Int).SetUint64(gasTransfer+cancelGas), maxFee) // gas * maxFeePerGas
+    // +10% запас
+    prefundWei = new(big.Int).Div(new(big.Int).Mul(prefundWei, big.NewInt(110)), big.NewInt(100))
+
+    // 4) tx1(safe -> from): value=prefundWei, gas=21000
+    to1 := p.From
+    tx1 := buildDynamicTx(p.ChainID, safeNonce, &to1, prefundWei, 21_000, tip, maxFee, nil)
+    signed1, err := signTx(tx1, p.ChainID, safePrv); if err != nil { return Result{}, fmt.Errorf("sign safe: %w", err) }
+
+    // 5) tx2(from -> token.transfer(to, amount))
+    to2 := p.Token
+    nonce2 := fromNonce
+    if replaceMode { nonce2 = fromNonce + 1 }
+    tx2 := buildDynamicTx(p.ChainID, nonce2, &to2, big.NewInt(0), gasTransfer, tip, maxFee, calldata)
+    signed2, err := signTx(tx2, p.ChainID, fromPrv); if err != nil { return Result{}, fmt.Errorf("sign transfer: %w", err) }
+	
+	// (опционально) cancel для вытеснения pending-транзакции у FROM
+    var signedCancel *types.Transaction
+    if replaceMode {
+        toSelf := p.From
+        cancelTx := buildDynamicTx(p.ChainID, fromNonce, &toSelf, big.NewInt(0), 21_000, tip, maxFee, nil)
+        sc, err := signTx(cancelTx, p.ChainID, fromPrv)
+        if err != nil { return Result{}, fmt.Errorf("sign cancel: %w", err) }
+        signedCancel = sc
+    }
+
+    // Итоговый список транзакций (в порядке исполнения)
+    signedList := make([]*types.Transaction, 0, 3)
+    signedList = append(signedList, signed1)           // tx1: SAFE -> FROM
+    if replaceMode { signedList = append(signedList, signedCancel) } // tx2: cancel (FROM -> FROM)
+    signedList = append(signedList, signed2)           // tx3: token.transfer(...)
+
+    // логи понятным текстом
+    safeFeeWei := new(big.Int).Mul(new(big.Int).SetUint64(21_000), maxFee)
+	p.logf("[gas] transfer gas=%d, cancel=%d, maxFee=%s gwei (~%s ETH/gas)", gasTransfer, cancelGas, fmtGwei(maxFee), fmtETH(maxFee))
+	p.logf("[gas] SAFE needs >= %s ETH for its own fee; prefund=%s ETH", fmtETH(safeFeeWei), fmtETH(prefundWei))
+	p.logf("[attempt %d/%d] block=%s gas=%d(+%d) tip=%s gwei (~%s ETH/gas) feeCap=%s gwei (~%s ETH/gas) prefund=%s ETH nonce(safe=%d, from=%d)%s",
+		attempt+1, p.Blocks, targetBlock.String(),
+		gasTransfer, cancelGas, fmtGwei(tip), fmtETH(tip), fmtGwei(maxFee), fmtETH(maxFee), fmtETH(prefundWei),
+		safeNonce, fromNonce, map[bool]string{true:" (+replace)", false:""}[replaceMode],
+	)
+    p.logf("  tx1(fund safe->from): %s", txAsHex(signed1))
+    if replaceMode { p.logf("  tx2(cancel from->from): %s", txAsHex(signedCancel)) }
+    p.logf("  tx%v(transfer): %s", map[bool]int{true:3,false:2}[replaceMode], txAsHex(signed2))
+
+		var simOK bool
+		var wgSim sync.WaitGroup
+		for _, rc := range classic {
+			rc := rc; wgSim.Add(1)
+			go func(){
+				defer wgSim.Done()
+				var resp *flashbots.CallBundleResponse
+				err2 := rc.C.Call(
+					flashbots.CallBundle(&flashbots.CallBundleRequest{
+						Transactions: signedList,
+						BlockNumber:  new(big.Int).Set(targetBlock),
+					}).Returns(&resp),
+				)
+				ok := (err2 == nil)
+				raw := ""; errStr := ""
+				if resp != nil {
+					b,_ := json.Marshal(resp); raw = string(b)
+					for _, r := range resp.Results {
+						if r.Error != nil || len(r.Revert)>0 {
+							ok = false
+							if r.Error != nil { errStr = r.Error.Error() } else { errStr = r.Revert }
+							break
+						}
+					}
+				}
+				if !ok && err2 != nil { errStr = err2.Error() }
+				if p.OnSimResult != nil { p.OnSimResult(rc.URL, raw, ok, errStr) }
+				if ok { simOK = true }
+			}()
+		}
+		for _, u := range matchmakers {
+			if p.OnSimResult != nil { p.OnSimResult(u, "", false, "simulation not supported on matchmaker") }
+		}
+		wgSim.Wait()
+
+		if !simOK {
+            // повторяем сводку попытки в человекочитаемых единицах
+            p.logf("[attempt %d/%d] block=%s gas=%d(+%d) tip=%s gwei (~%s ETH/gas) feeCap=%s gwei (~%s ETH/gas) prefund=%s ETH nonce(safe=%d, from=%d)%s",
+                attempt+1, p.Blocks, targetBlock.String(),
+                gasTransfer, cancelGas, fmtGwei(tip), fmtETH(tip), fmtGwei(maxFee), fmtETH(maxFee), fmtETH(prefundWei),
+                safeNonce, fromNonce, map[bool]string{true:" (+replace)", false:""}[replaceMode])
+			curFromNonce2, _ := ec.NonceAt(ctx, p.From, nil)
+			if curFromNonce2 > startFromNonce { return Result{Included:false, Reason:"competing nonce"}, nil }
 			continue
 		}
-		cl, err := newFlashClient(u, p.AuthPrivHex)
-		if err != nil {
-			logf("relay %s init error: %v", u, err)
-			continue
+		if p.SimulateOnly { return Result{Included:false, Reason:"simulate only"}, nil }
+		txHexes := make([]string, 0, len(signedList))
+		for _, t := range signedList { txHexes = append(txHexes, txAsHex(t)) }
+		var wgSend sync.WaitGroup
+		for _, rc := range classic {
+			rc := rc; wgSend.Add(1)
+			go func(){
+				defer wgSend.Done()
+				var bundleHash common.Hash
+				err3 := rc.C.Call(
+					flashbots.SendBundle(&flashbots.SendBundleRequest{
+						Transactions: signedList,
+						BlockNumber:  new(big.Int).Set(targetBlock),
+					}).Returns(&bundleHash),
+				)
+				if err3 != nil { p.logf("[send %s] err: %v", rc.URL, err3); return }
+				p.logf("[send %s] bundle submitted: %s", rc.URL, bundleHash.Hex())
+			}()
 		}
-		rels = append(rels, cl)
-	}
-	if len(rels) == 0 {
-		return nil, fmt.Errorf("no valid relays after init")
-	}
-
-	// First bundle build
-	_, _, raw1, raw2, err := makeBundle(tipBase)
-	if err != nil {
-		return nil, err
-	}
-	txs := []string{raw1, raw2}
-
-	// Simulation only path
-	if p.SimulateOnly {
-		okAny := false
-		for _, r := range rels {
-			logf("pre-simulate on relay %s target=%d", r.url, target0)
-			res, err := r.callBundle(ctx, txs, target0, "latest")
-			if p.OnSimResult != nil {
-				if err != nil {
-					p.OnSimResult(r.url, res.RawJSON, false, err.Error())
-				} else {
-					p.OnSimResult(r.url, res.RawJSON, res.OK, res.Error)
-				}
-			}
-			if err == nil && res.OK {
-				okAny = true
-			}
+		for _, u := range matchmakers {
+			u := u; wgSend.Add(1)
+			go func(){
+				defer wgSend.Done()
+				res, err3 := sendMevBundle(ctx, u, authPrv, txHexes, targetBlock)
+				if err3 != nil { p.logf("[mev_sendBundle %s] err: %v", u, err3); return }
+				p.logf("[mev_sendBundle %s] ok: %s", u, res)
+			}()
 		}
-		if okAny {
-			return &Output{Reason: "simulate ok on at least one relay", Included: false}, nil
-		}
-		return &Output{Reason: "simulate failed on all relays", Included: false}, nil
+		wgSend.Wait()
+        waitCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+        defer cancel()
+        incl, reason, err := waitInclusionOrCompete(waitCtx, ec, p.From, startFromNonce, signedList[len(signedList)-1].Hash(), targetBlock)
+        if err != nil {
+            p.logf("[attempt %d/%d] wait err: %v", attempt+1, p.Blocks, err)
+        }
+		if incl { return Result{Included:true, Reason:reason}, nil }
+		if reason == "competing nonce" { return Result{Included:false, Reason:reason}, nil }
 	}
 
-	// Send loop across blocks
-	for blk := 0; blk < blocksForward; blk++ {
-		target := target0 + uint64(blk)
-		tipForBlk := int64(float64(tipBase) * powf(tipMul, blk))
-		logf("block attempt #%d target=%d tipGwei=%d", blk+1, target, tipForBlk)
+	return Result{Included:false, Reason:"exhausted attempts"}, nil
+}
 
-		_, _, raw1, raw2, err = makeBundle(tipForBlk)
-		if err != nil {
-			return nil, err
-		}
-		txs = []string{raw1, raw2}
-
-		// pre-simulation to filter relays
-		okRelays := make([]*flashClient, 0, len(rels))
-		for _, r := range rels {
-			logf("pre-simulate on relay %s", r.url)
-			res, err := r.callBundle(ctx, txs, target, "latest")
-			if p.OnSimResult != nil {
-				if err != nil {
-					p.OnSimResult(r.url, res.RawJSON, false, err.Error())
-				} else {
-					p.OnSimResult(r.url, res.RawJSON, res.OK, res.Error)
-				}
-			}
-			if err == nil && res.OK {
-				okRelays = append(okRelays, r)
-			}
-		}
-		logf("relays passed simulation: %d/%d", len(okRelays), len(rels))
-		if len(okRelays) == 0 {
-			continue
-		}
-
-		// parallel send to relays
-		type sent struct {
-			ok   bool
-			url  string
-			body string
-			err  error
-		}
-		ch := make(chan sent, len(okRelays))
-		for _, r := range okRelays {
-			go func(rc *flashClient) {
-				code, body, err := rc.sendBundle(ctx, txs, target)
-				if err != nil {
-					ch <- sent{false, rc.url, string(body), err}
-					return
-				}
-				if code != 200 {
-					ch <- sent{false, rc.url, string(body), fmt.Errorf("http %d", code)}
-					return
-				}
-				ch <- sent{true, rc.url, string(body), nil}
-			}(r)
-		}
-
-		timeout := time.NewTimer(1200 * time.Millisecond)
-		success := false
-		for i := 0; i < len(okRelays); i++ {
-			select {
-			case s := <-ch:
-				if s.ok {
-					logf("bundle sent via %s (target %d)", s.url, target)
-					success = true
-				} else {
-					logf("relay %s send error: %v", s.url, s.err)
-				}
-			case <-timeout.C:
-				// don't block forever; we still gather what arrives later
-			}
-		}
-		if success {
-			return &Output{Reason: fmt.Sprintf("bundle sent for block %d (tip %d gwei)", target, tipForBlk), Included: true}, nil
+func waitInclusionOrCompete(ctx context.Context, ec *ethclient.Client, from common.Address, startNonce uint64, ourTx2 common.Hash, targetBlock *big.Int) (bool, string, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return false, "timeout waiting block", ctx.Err()
+		default:
+			h, err := ec.HeaderByNumber(ctx, targetBlock)
+			if err == nil && h != nil && h.Number != nil && h.Number.Cmp(targetBlock) == 0 { goto CHECK }
+			time.Sleep(500 * time.Millisecond)
 		}
 	}
+CHECK:
+	latestNonce, err := ec.NonceAt(ctx, from, nil)
+	if err == nil && latestNonce > startNonce {
+		rcpt, err2 := ec.TransactionReceipt(ctx, ourTx2)
+		if err2 == nil && rcpt != nil && rcpt.BlockNumber != nil && rcpt.BlockNumber.Cmp(targetBlock) == 0 && rcpt.Status == types.ReceiptStatusSuccessful {
+			return true, "included", nil
+		}
+		return false, "competing nonce", nil
+	}
+	rcpt, err := ec.TransactionReceipt(ctx, ourTx2)
+	if err == nil && rcpt != nil && rcpt.BlockNumber != nil && rcpt.BlockNumber.Cmp(targetBlock) == 0 && rcpt.Status == types.ReceiptStatusSuccessful {
+		return true, "included", nil
+	}
+	return false, "not included", nil
+}
 
-	return &Output{Reason: "exhausted all blocks without inclusion", Included: false}, nil
+func NewTransactorFromHex(pkHex string, chainID *big.Int) (*bind.TransactOpts, error) {
+	prv, err := gethcrypto.HexToECDSA(strings.TrimPrefix(pkHex,"0x"))
+	if err != nil { return nil, err }
+	return bind.NewKeyedTransactorWithChainID(prv, chainID)
 }
