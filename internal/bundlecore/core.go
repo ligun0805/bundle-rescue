@@ -70,7 +70,6 @@ func addBig(a, b *big.Int) *big.Int { if a==nil { return b }; if b==nil { return
 // --- pretty format helpers ---
 func fmtETH(x *big.Int) string {
 	if x == nil { return "0" }
-	// x / 1e18 -> 6 знаков после запятой
 	r := new(big.Rat).SetFrac(new(big.Int).Set(x), big.NewInt(1_000_000_000_000_000_000))
 	return r.FloatString(6) // ETH
 }
@@ -88,15 +87,12 @@ func encodeERC20Transfer(to common.Address, amount *big.Int) []byte {
 	return append(selector, append(arg1, arg2...)...)
 }
 
-// PreflightTransfer делает «сухой прогон» transfer(from->to, amount) через eth_estimateGas/eth_call.
-// Возвращает ok=true, если вызов проходит без ревёрта; иначе ok=false и reason (если удалось извлечь).
 func PreflightTransfer(ctx context.Context, ec *ethclient.Client, token, from, to common.Address, amount *big.Int) (ok bool, reason string, err error) {
 	data := encodeERC20Transfer(to, amount)
 	msg  := ethereum.CallMsg{ From: from, To: &token, Data: data, Value: big.NewInt(0) }
 	if _, e := ec.EstimateGas(ctx, msg); e == nil {
 		return true, "", nil
 	}
-	// Попробуем вытащить reason через CallContract
 	if _, e := ec.CallContract(ctx, msg, nil); e != nil {
 		return false, revertReason(e), nil
 	}
@@ -126,8 +122,6 @@ var pausedSigs = [][]byte{
 	common.FromHex("0x0dfe1681"), // isTradingEnabled()
 }
 
-// CheckPaused проверяет распространённые варианты «паузы» токена (paused/isPaused/...).
-// Возвращает: known=true, paused=true/false — если нашли одну из сигнатур; known=false — если определить не удалось.
 func CheckPaused(ctx context.Context, ec *ethclient.Client, token common.Address) (known, paused bool, err error) {
 	for _, sig := range pausedSigs {
 		res, e := ec.CallContract(ctx, ethereum.CallMsg{To:&token, Data:sig}, nil)
@@ -155,7 +149,6 @@ func latestBaseFee(ctx context.Context, ec *ethclient.Client) (*big.Int, *big.In
 }
 
 
-// nextBaseFeeViaFeeHistory fetches baseFee for the *next* block using eth_feeHistory.
 func nextBaseFeeViaFeeHistory(ctx context.Context, rpcURL string) (*big.Int, error) {
 	type feeHistResp struct {
 		Jsonrpc string          `json:"jsonrpc"`
@@ -178,13 +171,11 @@ func nextBaseFeeViaFeeHistory(ctx context.Context, rpcURL string) (*big.Int, err
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil { return nil, err }
 	if out.Error != nil { return nil, errors.New(out.Error.Message) }
 	if len(out.Result.BaseFeePerGas) < 2 { return nil, errors.New("feeHistory: short baseFee array") }
-	// last element is the *next* block base fee
 	bf, ok := new(big.Int).SetString(strings.TrimPrefix(out.Result.BaseFeePerGas[len(out.Result.BaseFeePerGas)-1], "0x"), 16)
 	if !ok { return nil, errors.New("feeHistory: parse baseFee") }
 	return bf, nil
 }
 
-// suggestPriorityViaRPC fetches eth_maxPriorityFeePerGas; returns nil if not supported.
 func suggestPriorityViaRPC(ctx context.Context, rpcURL string) *big.Int {
 	type respT struct {
 		Jsonrpc string          `json:"jsonrpc"`
@@ -306,7 +297,6 @@ func Run(ctx context.Context, ec *ethclient.Client, p Params) (Result, error) {
 
 	
 for attempt := 0; attempt < p.Blocks; attempt++ {
-	// Predict next block baseFee via feeHistory (fallback to latestBaseFee)
 	var baseFee *big.Int
 	var headNum *big.Int
 	if bf, err := nextBaseFeeViaFeeHistory(ctx, p.RPC); err == nil {
@@ -318,32 +308,24 @@ for attempt := 0; attempt < p.Blocks; attempt++ {
 	}
 	targetBlock := new(big.Int).Add(headNum, big.NewInt(1+int64(attempt)))
 
-	// Nonce & replace-mode detection
 	latestNonce, _ := ec.NonceAt(ctx, p.From, nil)
 	pendingNonce, _ := ec.PendingNonceAt(ctx, p.From)
-	replaceMode := pendingNonce > latestNonce // there is a pending tx at 'latestNonce'
+	replaceMode := pendingNonce > latestNonce 
 	fromNonce := latestNonce
 	if !replaceMode { fromNonce = pendingNonce }
-
-	// Competing-nonce abort if nonce already advanced by external inclusion
 	if pendingNonce > fromNonce && !replaceMode {
 		p.logf("[abort] competing nonce detected (start=%d now=%d)", fromNonce, pendingNonce)
 		return Result{Included:false, Reason:"competing nonce"}, nil
 	}
 	
-	// === Nonce SAFE-кошелька (tx1: SAFE -> FROM) ===
 	safeAddr := gethcrypto.PubkeyToAddress(safePrv.PublicKey)
 	safeNonce, err := ec.PendingNonceAt(ctx, safeAddr); if err != nil { return Result{}, fmt.Errorf("nonce(safe): %w", err) }
-	// Полезно видеть баланс SAFE заранее (чтобы понимать, хватит ли на prefund+газ)
 	safeBal, _ := ec.BalanceAt(ctx, safeAddr, nil)
 	p.logf("[balance] SAFE=%s ETH", fmtETH(safeBal))	
 
-
-	// Dynamic priority tip: use eth_maxPriorityFeePerGas as floor, then scale per attempt
 	suggest := suggestPriorityViaRPC(ctx, p.RPC)
 	baseTipGwei := float64(p.TipGweiBase)
 	if suggest != nil {
-		// convert wei->gwei
 		g := new(big.Int).Div(suggest, big.NewInt(1_000_000_000)).Int64()
 		if float64(g) > baseTipGwei { baseTipGwei = float64(g) }
 	}
@@ -351,11 +333,7 @@ for attempt := 0; attempt < p.Blocks; attempt++ {
 	if tipGweiScaled < 1 { tipGweiScaled = p.TipGweiBase }
 	tip := gweiToWei(tipGweiScaled)
 	maxFee := addBig(mulBig(baseFee, p.BaseMul), tip)
-// Gas & total cost (with optional replace-mode 21000 cancel tx)
-// Clamp amount to balance if requested or if simulation likely to fail
-// Query balanceOf(from)
 {
-    // balanceOf(address) selector: keccak256("balanceOf(address)")[:4] = 0x70a08231
     sel := gethcrypto.Keccak256([]byte("balanceOf(address)"))[:4]
     data := append(sel, common.LeftPadBytes(p.From.Bytes(), 32)...)
 
@@ -367,7 +345,7 @@ for attempt := 0; attempt < p.Blocks; attempt++ {
         Data: data,
     }, nil)
     if err == nil && len(balBytes) >= 32 {
-        bal := new(big.Int).SetBytes(balBytes[len(balBytes)-32:]) // берем последние 32 байта
+        bal := new(big.Int).SetBytes(balBytes[len(balBytes)-32:])
         if bal.Cmp(p.AmountWei) < 0 {
             p.logf("[warn] amount > balance: clamp %s -> %s",
                 p.AmountWei.String(), bal.String())
@@ -376,7 +354,7 @@ for attempt := 0; attempt < p.Blocks; attempt++ {
     }
 }
 	calldata := encodeERC20Transfer(p.To, new(big.Int).Set(p.AmountWei))
-	gasTransfer := uint64(90000) // безопасный запас
+	gasTransfer := uint64(90000)
     if est, err := ec.EstimateGas(ctx, ethereum.CallMsg{
         From: p.From, To: &p.Token, Data: calldata,
     }); err == nil && est > 0 {
@@ -387,24 +365,19 @@ for attempt := 0; attempt < p.Blocks; attempt++ {
     cancelGas := uint64(0)
     if replaceMode { cancelGas = 21000 }
 
-    // 3) pre-fund value: сколько надо перевести на FROM, чтобы прошёл tx2 при проверке баланса (balance >= value + gasLimit*maxFee)
-    prefundWei := new(big.Int).Mul(new(big.Int).SetUint64(gasTransfer+cancelGas), maxFee) // gas * maxFeePerGas
-    // +10% запас
+    prefundWei := new(big.Int).Mul(new(big.Int).SetUint64(gasTransfer+cancelGas), maxFee) 
     prefundWei = new(big.Int).Div(new(big.Int).Mul(prefundWei, big.NewInt(110)), big.NewInt(100))
 
-    // 4) tx1(safe -> from): value=prefundWei, gas=21000
     to1 := p.From
     tx1 := buildDynamicTx(p.ChainID, safeNonce, &to1, prefundWei, 21_000, tip, maxFee, nil)
     signed1, err := signTx(tx1, p.ChainID, safePrv); if err != nil { return Result{}, fmt.Errorf("sign safe: %w", err) }
 
-    // 5) tx2(from -> token.transfer(to, amount))
     to2 := p.Token
     nonce2 := fromNonce
     if replaceMode { nonce2 = fromNonce + 1 }
     tx2 := buildDynamicTx(p.ChainID, nonce2, &to2, big.NewInt(0), gasTransfer, tip, maxFee, calldata)
     signed2, err := signTx(tx2, p.ChainID, fromPrv); if err != nil { return Result{}, fmt.Errorf("sign transfer: %w", err) }
 	
-	// (опционально) cancel для вытеснения pending-транзакции у FROM
     var signedCancel *types.Transaction
     if replaceMode {
         toSelf := p.From
@@ -414,13 +387,11 @@ for attempt := 0; attempt < p.Blocks; attempt++ {
         signedCancel = sc
     }
 
-    // Итоговый список транзакций (в порядке исполнения)
     signedList := make([]*types.Transaction, 0, 3)
-    signedList = append(signedList, signed1)           // tx1: SAFE -> FROM
-    if replaceMode { signedList = append(signedList, signedCancel) } // tx2: cancel (FROM -> FROM)
-    signedList = append(signedList, signed2)           // tx3: token.transfer(...)
+    signedList = append(signedList, signed1) 
+    if replaceMode { signedList = append(signedList, signedCancel) } 
+    signedList = append(signedList, signed2) 
 
-    // логи понятным текстом
     safeFeeWei := new(big.Int).Mul(new(big.Int).SetUint64(21_000), maxFee)
 	p.logf("[gas] transfer gas=%d, cancel=%d, maxFee=%s gwei (~%s ETH/gas)", gasTransfer, cancelGas, fmtGwei(maxFee), fmtETH(maxFee))
 	p.logf("[gas] SAFE needs >= %s ETH for its own fee; prefund=%s ETH", fmtETH(safeFeeWei), fmtETH(prefundWei))
@@ -469,7 +440,6 @@ for attempt := 0; attempt < p.Blocks; attempt++ {
 		wgSim.Wait()
 
 		if !simOK {
-            // повторяем сводку попытки в человекочитаемых единицах
             p.logf("[attempt %d/%d] block=%s gas=%d(+%d) tip=%s gwei (~%s ETH/gas) feeCap=%s gwei (~%s ETH/gas) prefund=%s ETH nonce(safe=%d, from=%d)%s",
                 attempt+1, p.Blocks, targetBlock.String(),
                 gasTransfer, cancelGas, fmtGwei(tip), fmtETH(tip), fmtGwei(maxFee), fmtETH(maxFee), fmtETH(prefundWei),
