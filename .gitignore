@@ -1,6 +1,2 @@
 .env
-.env.local
-bundlecli
-bundlegui
 /dist
-*.exe
