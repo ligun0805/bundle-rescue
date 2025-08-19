@@ -368,6 +368,11 @@ func openAddPairWindow(a fyne.App, rpc string) {
 			if known { if paused { pausedLine = "PAUSED: yes" } else { pausedLine = "PAUSED: no" } }
 			xferLine := "Transferable: enter To & Amount to test"
 			limitsLine := "Limits: unknown"
+			restrLine := "Restrictions: n/a"
+			if common.IsHexAddress(from) && common.IsHexAddress(strings.TrimSpace(toE.Text)) {
+				r, err := core.CheckRestrictions(ctx, ec, common.HexToAddress(token), common.HexToAddress(from), common.HexToAddress(strings.TrimSpace(toE.Text)))
+				if err == nil { restrLine = "Restrictions: " + r.Summary() } else { restrLine = "Restrictions: error: " + err.Error() }
+			}			
 			warnLines := ""
 			if ok, txBps, walletBps, ts := tryReadBPSAndTS(ec, common.HexToAddress(token)); ok {
 				maxTxWei := new(big.Int).Div(new(big.Int).Mul(ts, big.NewInt(int64(txBps))), big.NewInt(10_000))
@@ -399,8 +404,8 @@ func openAddPairWindow(a fyne.App, rpc string) {
 					xferLine = "Transferable: amount invalid"
 				}
 			}
-			msg := fmt.Sprintf("Decimals: %d\nBalance (wei): %s\nBalance (tokens): %s\n%s\n%s\n%s%s",
-				dec, bal.String(), formatTokensFromWei(bal, dec), pausedLine, xferLine, limitsLine,
+			msg := fmt.Sprintf("Decimals: %d\nBalance (wei): %s\nBalance (tokens): %s\n%s\n%s\n%s\n%s%s",
+				dec, bal.String(), formatTokensFromWei(bal, dec), pausedLine, restrLine, xferLine, limitsLine,
 				func() string { if warnLines!="" { return "\n"+warnLines }; return "" }(),
 			)
 			status.SetText(msg)
@@ -428,6 +433,10 @@ func openAddPairWindow(a fyne.App, rpc string) {
 		if bal.Cmp(w) < 0 { status.SetText("Rejected: balance < amount"); spinner.Hide(); return }
 		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second); defer cancel()
 		if known, paused, _ := core.CheckPaused(ctx, ec, common.HexToAddress(token)); known && paused { status.SetText("Rejected: token is PAUSED"); spinner.Hide(); return }
+		restr, err := core.CheckRestrictions(ctx, ec, common.HexToAddress(token), common.HexToAddress(from), common.HexToAddress(strings.TrimSpace(toE.Text)))
+		if err == nil && restr.Blocked() {
+			status.SetText("Rejected: " + restr.Summary()); spinner.Hide(); return
+		}
 
 		if ok, reason, _ := core.PreflightTransfer(ctx, ec, common.HexToAddress(token), common.HexToAddress(from), common.HexToAddress(to), w); !ok { status.SetText("Rejected: token not transferable (" + reason + ")"); spinner.Hide(); return }
 		pairs = append(pairs, pairRow{ Token: token, From: from, FromPK: fromPk, To: to, AmountTokens: amountTok, AmountWei: w.String(), Decimals: dec, BalanceWei: bal.String(), BalanceTokens: formatTokensFromWei(bal, dec) })

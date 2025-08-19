@@ -16,8 +16,10 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	gethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -136,6 +138,99 @@ func CheckPaused(ctx context.Context, ec *ethclient.Client, token common.Address
 	return false, false, nil
 }
 
+var (
+	blacklistAddrViewSigsStr = []string{
+		"isBlacklisted(address)", "isBlackListed(address)", "blacklisted(address)", "isInBlacklist(address)",
+	}
+	whitelistAddrViewSigsStr = []string{
+		"isWhitelisted(address)", "whitelisted(address)",
+	}
+	onlyWhitelistGlobalSigsStr = []string{
+		"onlyWhitelisted()", "whitelistEnabled()",
+	}
+	transferDisabledGlobalSigsStr = []string{
+		"transferDisabled()", "isTransferDisabled()", "transfersPaused()",
+	}
+)
+
+func sel(sig string) []byte {
+	h := gethcrypto.Keccak256([]byte(sig))
+	return h[:4]
+}
+
+type TokenRestrictions struct {
+	Paused           bool
+	TransferDisabled bool
+	OnlyWhitelisted  bool
+	FromWhitelisted  *bool
+	ToWhitelisted    *bool
+	BlacklistedFrom  bool
+	BlacklistedTo    bool
+}
+
+func (tr TokenRestrictions) Blocked() bool {
+	if tr.Paused || tr.TransferDisabled || tr.BlacklistedFrom || tr.BlacklistedTo { return true }
+	if tr.OnlyWhitelisted {
+		if tr.FromWhitelisted != nil && !*tr.FromWhitelisted { return true }
+		if tr.ToWhitelisted != nil && !*tr.ToWhitelisted { return true }
+	}
+	return false
+}
+
+func (tr TokenRestrictions) Summary() string {
+	parts := []string{}
+	if tr.Paused { parts = append(parts, "paused") }
+	if tr.TransferDisabled { parts = append(parts, "transferDisabled") }
+	if tr.BlacklistedFrom { parts = append(parts, "from:blacklisted") }
+	if tr.BlacklistedTo { parts = append(parts, "to:blacklisted") }
+	if tr.OnlyWhitelisted {
+		wf := "unknown"; if tr.FromWhitelisted != nil { if *tr.FromWhitelisted { wf="yes" } else { wf="no" } }
+		wt := "unknown"; if tr.ToWhitelisted != nil { if *tr.ToWhitelisted { wt="yes" } else { wt="no" } }
+		parts = append(parts, fmt.Sprintf("whitelist:on (from=%s,to=%s)", wf, wt))
+	}
+	if len(parts)==0 { return "none" }
+	return strings.Join(parts, ", ")
+}
+
+func CheckRestrictions(ctx context.Context, ec *ethclient.Client, token common.Address, from, to common.Address) (TokenRestrictions, error) {
+	var out TokenRestrictions
+	known, paused, _ := CheckPaused(ctx, ec, token)
+	if known && paused { out.Paused = true; return out, nil }
+	call := func(data []byte) (ret []byte, ok bool) {
+		res, err := ec.CallContract(ctx, ethereum.CallMsg{ To:&token, Data:data }, nil)
+		if err != nil || len(res) == 0 { return nil, false }
+		return res, true
+	}
+	boolOf := func(b []byte) bool { if len(b)==0 { return false }; return b[len(b)-1]==1 }
+	for _, s := range transferDisabledGlobalSigsStr {
+		if ret, ok := call(sel(s)); ok && boolOf(ret) { out.TransferDisabled = true; return out, nil }
+	}
+	for _, s := range onlyWhitelistGlobalSigsStr {
+		if ret, ok := call(sel(s)); ok && boolOf(ret) { out.OnlyWhitelisted = true; break }
+	}
+	whitelisted := func(addr common.Address) *bool {
+		for _, s := range whitelistAddrViewSigsStr {
+			data := append(sel(s), common.LeftPadBytes(addr.Bytes(), 32)...)
+			if ret, ok := call(data); ok { v := boolOf(ret); return &v }
+		}
+		return nil
+	}
+	if out.OnlyWhitelisted {
+		out.FromWhitelisted = whitelisted(from)
+		out.ToWhitelisted   = whitelisted(to)
+	}
+	isBlacklisted := func(addr common.Address) bool {
+		for _, s := range blacklistAddrViewSigsStr {
+			data := append(sel(s), common.LeftPadBytes(addr.Bytes(), 32)...)
+			if ret, ok := call(data); ok && boolOf(ret) { return true }
+		}
+		return false
+	}
+	out.BlacklistedFrom = isBlacklisted(from)
+	out.BlacklistedTo   = isBlacklisted(to)
+	return out, nil
+}
+
 func estimateTransferGas(ctx context.Context, ec *ethclient.Client, from common.Address, token common.Address, data []byte) (uint64, error) {
 	msg := ethereum.CallMsg{ From: from, To:&token, Value:big.NewInt(0), Data:data }
 	return ec.EstimateGas(ctx, msg)
@@ -243,8 +338,10 @@ func sendMevBundle(ctx context.Context, url string, authPriv *ecdsa.PrivateKey, 
 	req.Header.Set("Content-Type", "application/json")
 	if authPriv != nil {
 		addr := gethcrypto.PubkeyToAddress(authPriv.PublicKey)
-		sig := gethcrypto.Keccak256Hash(body).Hex()
-		req.Header.Set("X-Flashbots-Signature", addr.Hex()+":"+sig)
+		msgHash := accounts.TextHash(body)
+		sigBytes, err := gethcrypto.Sign(msgHash, authPriv)
+		if err != nil { return "", fmt.Errorf("sign header: %w", err) }
+		req.Header.Set("X-Flashbots-Signature", addr.Hex()+":"+hexutil.Encode(sigBytes))
 	}
 
 	resp, err := http.DefaultClient.Do(req)
@@ -255,6 +352,64 @@ func sendMevBundle(ctx context.Context, url string, authPriv *ecdsa.PrivateKey, 
 	if out.Error != nil { return "", errors.New(out.Error.Message) }
 	return string(out.Result), nil
 }
+
+func simulateMevBundle(ctx context.Context, url string, authPriv *ecdsa.PrivateKey, txHexes []string, targetBlock *big.Int) (string, bool, error) {
+	payload := map[string]any{ "txs": txHexes, "blockNumber": fmt.Sprintf("0x%x", targetBlock) }
+	params := []any{ payload }
+	body, _ := json.Marshal(rpcReq{ Jsonrpc:"2.0", Method:"mev_simBundle", Params: params, ID:1 })
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if authPriv != nil {
+		addr := gethcrypto.PubkeyToAddress(authPriv.PublicKey)
+		msgHash := accounts.TextHash(body)
+		if sigBytes, err := gethcrypto.Sign(msgHash, authPriv); err == nil {
+			req.Header.Set("X-Flashbots-Signature", addr.Hex()+":"+hexutil.Encode(sigBytes))
+		}
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { return "", false, err }
+	defer resp.Body.Close()
+	var out rpcResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		if resp.StatusCode == 404 { return "", false, nil }
+		return "", false, err
+	}
+	if out.Error != nil {
+		if strings.Contains(out.Error.Message, "Method not found") { return "", false, nil }
+		return "", true, errors.New(out.Error.Message)
+	}
+	bs, _ := json.Marshal(out.Result)
+	return string(bs), true, nil
+}
+
+type relayClient struct {
+	URL string
+	C   *w3.Client
+}
+
+func classifyRelays(relays []string, dial func(url string) *w3.Client) (classic []relayClient, matchmakers []string) {
+	for _, r := range relays {
+		u := strings.TrimSpace(r)
+		if u == "" {
+			continue
+		}
+		low := strings.ToLower(u)
+		switch {
+		case strings.HasPrefix(low, "mm:"):
+			matchmakers = append(matchmakers, strings.TrimPrefix(u, "mm:"))
+		case strings.HasPrefix(low, "classic:"):
+			u2 := strings.TrimPrefix(u, "classic:")
+			classic = append(classic, relayClient{URL: u2, C: dial(u2)})
+		case strings.Contains(low, "mev") || strings.Contains(low, "matchmaker"):
+			// backward compatibility: эвристика как раньше
+			matchmakers = append(matchmakers, u)
+		default:
+			classic = append(classic, relayClient{URL: u, C: dial(u)})
+		}
+	}
+	return
+}
+
 
 func Run(ctx context.Context, ec *ethclient.Client, p Params) (Result, error) {
 	if p.AmountWei == nil || p.AmountWei.Sign() <= 0 { return Result{}, errors.New("AmountWei must be > 0") }
@@ -273,17 +428,7 @@ func Run(ctx context.Context, ec *ethclient.Client, p Params) (Result, error) {
 		}
 	}
 
-	type relayClient struct { URL string; C *w3.Client }
-	var classic []relayClient
-	var matchmakers []string
-	for _, r := range p.Relays {
-		u := strings.TrimSpace(r); if u=="" { continue }
-		if strings.Contains(strings.ToLower(u), "mev") || strings.Contains(strings.ToLower(u), "matchmaker") {
-			matchmakers = append(matchmakers, u)
-		} else {
-			classic = append(classic, relayClient{URL: u, C: flashbots.MustDial(u, authPrv)})
-		}
-	}
+	classic, matchmakers := classifyRelays(p.Relays, func(u string) *w3.Client { return flashbots.MustDial(u, authPrv) })
 	if len(classic) == 0 && len(matchmakers) == 0 {
 		return Result{}, errors.New("no relays or matchmakers configured")
 	}
@@ -292,6 +437,11 @@ func Run(ctx context.Context, ec *ethclient.Client, p Params) (Result, error) {
 	if p.TipMul <= 0 { p.TipMul = 1.2 }
 	if p.BaseMul <= 0 { p.BaseMul = 2 }
 	if p.BufferPct < 0 { p.BufferPct = 0 }
+	if restr, err := CheckRestrictions(ctx, ec, p.Token, p.From, p.To); err == nil && restr.Blocked() {
+		p.logf("[pre-check] token restricted => %s", restr.Summary())
+		return Result{Included:false, Reason:"token restricted: "+restr.Summary()}, nil
+	}
+	
 
 	startFromNonce, err := ec.PendingNonceAt(ctx, p.From); if err != nil { return Result{}, fmt.Errorf("nonce(from): %w", err) }
 
@@ -404,6 +554,9 @@ for attempt := 0; attempt < p.Blocks; attempt++ {
     if replaceMode { p.logf("  tx2(cancel from->from): %s", txAsHex(signedCancel)) }
     p.logf("  tx%v(transfer): %s", map[bool]int{true:3,false:2}[replaceMode], txAsHex(signed2))
 
+		txHexes := make([]string, 0, len(signedList))
+		for _, t := range signedList { txHexes = append(txHexes, txAsHex(t)) }
+
 		var simOK bool
 		var wgSim sync.WaitGroup
 		for _, rc := range classic {
@@ -435,7 +588,9 @@ for attempt := 0; attempt < p.Blocks; attempt++ {
 			}()
 		}
 		for _, u := range matchmakers {
-			if p.OnSimResult != nil { p.OnSimResult(u, "", false, "simulation not supported on matchmaker") }
+			if p.OnSimResult != nil {
+				if raw, ok, err := simulateMevBundle(ctx, u, authPrv, txHexes, targetBlock); ok { p.OnSimResult(u, raw, err==nil, "") } else { p.OnSimResult(u, "", false, "simulation not supported on matchmaker") }
+			}
 		}
 		wgSim.Wait()
 
@@ -449,8 +604,6 @@ for attempt := 0; attempt < p.Blocks; attempt++ {
 			continue
 		}
 		if p.SimulateOnly { return Result{Included:false, Reason:"simulate only"}, nil }
-		txHexes := make([]string, 0, len(signedList))
-		for _, t := range signedList { txHexes = append(txHexes, txAsHex(t)) }
 		var wgSend sync.WaitGroup
 		for _, rc := range classic {
 			rc := rc; wgSend.Add(1)

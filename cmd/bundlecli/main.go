@@ -88,7 +88,7 @@ func main() {
 		if known && paused {
 			fmt.Println("  [X] Токен в состоянии PAUSED — переход к следующему")
 			continue
-		}
+		}	
 		bal, err := fetchTokenBalance(ctx, ec, tokenAddr, fromAddr)
 		if err != nil { fmt.Println("  [!] Ошибка чтения баланса токена:", err); continue }
 		fmt.Println("  Decimals:", dec, " | TokenBalance(from):", formatTokensFromWei(bal, dec))
@@ -104,6 +104,17 @@ func main() {
 		to := readLine(reader, "Введите адрес получателя: ")
 		if !common.IsHexAddress(to) { fmt.Println("  [!] Некорректный адрес получателя"); continue }
 		toAddr := common.HexToAddress(to)
+		
+		restr, err := core.CheckRestrictions(ctx, ec, tokenAddr, fromAddr, toAddr)
+		if err == nil {
+			fmt.Println("  Restrictions:", restr.Summary())
+			if restr.Blocked() {
+				fmt.Println("  [X] Токен заблокирован правилами контракта — переход к следующему")
+				continue
+			}
+		} else {
+			fmt.Println("  Restrictions: error:", err)
+		}
 		
 		if ok, txBps, walBps, ts := tryReadBPSAndTS(ctx, ec, tokenAddr); ok {
 			maxTxWei := new(big.Int).Div(new(big.Int).Mul(ts, big.NewInt(int64(txBps))), big.NewInt(10_000))
@@ -217,7 +228,11 @@ func readPassword(prompt string) string {
 
 
 func fetchTokenDecimals(ctx context.Context, ec *ethclient.Client, token common.Address) (int, error) {
-	res, err := ec.CallContract(ctx, ethereum.CallMsg{To: &token, Data: data}, nil)
+	// function decimals() -> uint8 : 0x313ce567
+	decimalsSelector := common.FromHex("0x313ce567")
+	res, err := ec.CallContract(ctx, ethereum.CallMsg{
+		To: &token, Data: decimalsSelector,
+	}, nil)
 	if err != nil { return 0, err }
 	if len(res)==0 { return 18, nil }
 	return int(res[len(res)-1]), nil
