@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -26,6 +27,17 @@ import (
 	"github.com/ethereum/go-ethereum"	
 	core "github.com/ligun0805/bundle-rescue/internal/bundlecore"
 )
+
+func isRPCTimeout(err error) bool {
+	if err == nil { return false }
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "deadline exceeded") ||
+		strings.Contains(s, "timeout") ||
+		strings.Contains(s, "timed out") ||
+		strings.Contains(s, "i/o timeout") ||
+		strings.Contains(s, "context canceled")
+}
+
 
 var (
 	runCtx context.Context
@@ -48,6 +60,8 @@ var (
 
 	pairs []pairRow
 	table *widget.Table
+	addWinsMu sync.Mutex
+	addWins   []fyne.Window	
 )
 
 func ensureLogWindow(a fyne.App) fyne.Window {
@@ -312,14 +326,31 @@ func rebuildViewIdx() {
 	})
 }
 
-func openAddPairWindow(a fyne.App, rpc string) {
+func openAddPairWindow(a fyne.App, rpc string, safePk string) {
 	win := a.NewWindow("Add Pair")
-	win.SetOnClosed(func(){ })
+	addWinsMu.Lock()
+	addWins = append(addWins, win)
+	addWinsMu.Unlock()
+	win.SetOnClosed(func(){
+		addWinsMu.Lock()
+		for i,w2 := range addWins {
+			if w2 == win {
+				addWins = append(addWins[:i], addWins[i+1:]...)
+				break
+			}
+		}
+		addWinsMu.Unlock()
+	})
 	tokenE := widget.NewEntry()
 	fromE := widget.NewEntry()
 	fromPkE := widget.NewPasswordEntry()
 	toE := widget.NewEntry()
 	amountTokE := widget.NewEntry()
+	if s := strings.TrimSpace(safePk); s != "" {
+		if addr, err := deriveAddrFromPK(s); err == nil {
+			toE.SetText(addr)
+		}
+	}
 	decE := widget.NewEntry()
 	status := widget.NewLabel("")
 	spinner := widget.NewProgressBarInfinite()
@@ -348,101 +379,66 @@ func openAddPairWindow(a fyne.App, rpc string) {
 		fromE.SetText(addr)
 	}
 
-	checkBtn := widget.NewButtonWithIcon("CHECK", theme.SearchIcon(), func(){
-		spinner.Show(); status.SetText("Checking…")
-		go func(){
-			ec, err := ethclient.Dial(rpc); if err != nil { status.SetText("RPC dial: "+err.Error()); return }
-			token := strings.TrimSpace(tokenE.Text)
-			if !common.IsHexAddress(token) { status.SetText("Token address invalid"); return }
-			from := strings.TrimSpace(fromE.Text)
-			if from=="" && strings.TrimSpace(fromPkE.Text)!="" {
-				if addr,err := deriveAddrFromPK(fromPkE.Text); err==nil { from = addr; fromE.SetText(addr) }
-			}
-			if !common.IsHexAddress(from) { status.SetText("From address invalid (derive from PK?)"); spinner.Hide(); return }
-			dec, err := fetchTokenDecimals(ec, common.HexToAddress(token)); if err!=nil { status.SetText("decimals: "+err.Error()); spinner.Hide(); return }
-			bal, err := fetchTokenBalance(ec, common.HexToAddress(token), common.HexToAddress(from)); if err!=nil { status.SetText("balance: "+err.Error()); spinner.Hide(); return }
-		
-			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second); defer cancel()
-			known, paused, _ := core.CheckPaused(ctx, ec, common.HexToAddress(token))
-			pausedLine := "Not pausable"
-			if known { if paused { pausedLine = "PAUSED: yes" } else { pausedLine = "PAUSED: no" } }
-			xferLine := "Transferable: enter To & Amount to test"
-			limitsLine := "Limits: unknown"
-			restrLine := "Restrictions: n/a"
-			if common.IsHexAddress(from) && common.IsHexAddress(strings.TrimSpace(toE.Text)) {
-				r, err := core.CheckRestrictions(ctx, ec, common.HexToAddress(token), common.HexToAddress(from), common.HexToAddress(strings.TrimSpace(toE.Text)))
-				if err == nil { restrLine = "Restrictions: " + r.Summary() } else { restrLine = "Restrictions: error: " + err.Error() }
-			}			
-			warnLines := ""
-			if ok, txBps, walletBps, ts := tryReadBPSAndTS(ec, common.HexToAddress(token)); ok {
-				maxTxWei := new(big.Int).Div(new(big.Int).Mul(ts, big.NewInt(int64(txBps))), big.NewInt(10_000))
-				maxWalWei := new(big.Int).Div(new(big.Int).Mul(ts, big.NewInt(int64(walletBps))), big.NewInt(10_000))
-				limitsLine = fmt.Sprintf("Limits: maxTx=%s (%d bps), maxWallet=%s (%d bps)",
-					formatTokensFromWei(maxTxWei, dec), txBps,
-					formatTokensFromWei(maxWalWei, dec), walletBps,
-				)
-				toAddr := strings.TrimSpace(toE.Text)
-				if common.IsHexAddress(toAddr) && strings.TrimSpace(amountTokE.Text) != "" {
-					if w, e := toWeiFromTokens(amountTokE.Text, dec); e == nil {
-						toBal, _ := fetchTokenBalance(ec, common.HexToAddress(token), common.HexToAddress(toAddr))
-						if w.Cmp(maxTxWei) > 0 {
-							warnLines += fmt.Sprintf("[WARN] amount > maxTx (%s > %s)\n", formatTokensFromWei(w, dec), formatTokensFromWei(maxTxWei, dec))
-						}
-						if new(big.Int).Add(toBal, w).Cmp(maxWalWei) > 0 {
-							warnLines += fmt.Sprintf("[WARN] toBalance+amount > maxWallet (%s+%s > %s)\n",
-								formatTokensFromWei(toBal, dec), formatTokensFromWei(w, dec), formatTokensFromWei(maxWalWei, dec))
-						}
-					}
-				}
-			}			
-			toAddr := strings.TrimSpace(toE.Text)
-			if common.IsHexAddress(toAddr) && strings.TrimSpace(amountTokE.Text) != "" {
-				if w, e := toWeiFromTokens(amountTokE.Text, dec); e == nil {
-					ok, reason, _ := core.PreflightTransfer(ctx, ec, common.HexToAddress(token), common.HexToAddress(from), common.HexToAddress(toAddr), w)
-					if ok { xferLine = "Transferable: yes" } else { xferLine = "Transferable: no (" + reason + ")" }
-				} else {
-					xferLine = "Transferable: amount invalid"
-				}
-			}
-			msg := fmt.Sprintf("Decimals: %d\nBalance (wei): %s\nBalance (tokens): %s\n%s\n%s\n%s\n%s%s",
-				dec, bal.String(), formatTokensFromWei(bal, dec), pausedLine, restrLine, xferLine, limitsLine,
-				func() string { if warnLines!="" { return "\n"+warnLines }; return "" }(),
-			)
-			status.SetText(msg)
-			if decE.Text=="" { decE.SetText(strconv.Itoa(dec)) }
-			spinner.Hide()
-		}()
-	})
 	saveBtn := widget.NewButtonWithIcon("SAVE", theme.DocumentSaveIcon(), func(){
 		spinner.Show(); status.SetText("Saving…")
 		token := strings.TrimSpace(tokenE.Text)
-		from := strings.TrimSpace(fromE.Text)
 		fromPk := strings.TrimSpace(fromPkE.Text)
 		to := strings.TrimSpace(toE.Text)
-		amountTok := strings.TrimSpace(amountTokE.Text)
-		dec := atoi(decE.Text, -1)
-		if token=="" || to=="" || fromPk=="" || amountTok=="" { status.SetText("Fill required fields"); spinner.Hide(); return }
-		if from=="" {
-			if addr,err := deriveAddrFromPK(fromPk); err==nil { from = addr } else { status.SetText("Cannot derive From from PK"); spinner.Hide(); return }
+		if fromPk == "" { status.SetText("Enter From PK"); spinner.Hide(); return }
+		from := strings.TrimSpace(fromE.Text)
+		if from == "" {
+			if addr, err := deriveAddrFromPK(fromPk); err == nil { from = addr; fromE.SetText(addr) } else { status.SetText("Cannot derive From from PK"); spinner.Hide(); return }
 		}
-		if !common.IsHexAddress(token) || !common.IsHexAddress(from) || !common.IsHexAddress(to) { status.SetText("addresses invalid"); spinner.Hide(); return }
- 		if dec < 0 { dec = 18 }
+		if to == "" {
+			if addr, err := deriveAddrFromPK(strings.TrimSpace(safePk)); err == nil { to = addr; toE.SetText(addr) }
+		}
+		if token == "" || !common.IsHexAddress(token) { status.SetText("Token address invalid"); spinner.Hide(); return }
+		if !common.IsHexAddress(from) { status.SetText("From address invalid"); spinner.Hide(); return }
+		if !common.IsHexAddress(to)   { status.SetText("To address invalid"); spinner.Hide(); return }
 		ec, err := ethclient.Dial(rpc); if err != nil { status.SetText("RPC dial: "+err.Error()); spinner.Hide(); return }
-		w, err := toWeiFromTokens(amountTok, dec); if err!=nil { status.SetText("amount: "+err.Error()); spinner.Hide(); return }
-		bal, err := fetchTokenBalance(ec, common.HexToAddress(token), common.HexToAddress(from)); if err!=nil { status.SetText("balance: "+err.Error()); spinner.Hide(); return }
+		dec := atoi(decE.Text, -1)
+		if dec < 0 {
+			if d, e := fetchTokenDecimals(ec, common.HexToAddress(token)); e == nil { dec = d; decE.SetText(fmt.Sprintf("%d", d)) } else { status.SetText("decimals: "+e.Error()); spinner.Hide(); return }
+		}
+		amountTok := strings.TrimSpace(strings.ReplaceAll(amountTokE.Text, ",", "."))
+		bal, err := fetchTokenBalance(ec, common.HexToAddress(token), common.HexToAddress(from)); if err != nil { status.SetText("balance: "+err.Error()); spinner.Hide(); return }
+		var w *big.Int
+		if amountTok == "" || strings.EqualFold(amountTok, "all") {
+			w = new(big.Int).Set(bal)
+			amountTok = formatTokensFromWei(w, dec)
+			amountTokE.SetText(amountTok)
+		} else {
+			if ww, e := toWeiFromTokens(amountTok, dec); e == nil { w = ww } else { status.SetText("amount: "+e.Error()); spinner.Hide(); return }
+		}
 		if bal.Cmp(w) < 0 { status.SetText("Rejected: balance < amount"); spinner.Hide(); return }
-		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second); defer cancel()
-		if known, paused, _ := core.CheckPaused(ctx, ec, common.HexToAddress(token)); known && paused { status.SetText("Rejected: token is PAUSED"); spinner.Hide(); return }
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second); defer cancel()
+		if known, paused, _ := core.CheckPaused(ctx, ec, common.HexToAddress(token)); known && paused {
+			status.SetText("Rejected: token is PAUSED"); spinner.Hide(); return
+		}
 		restr, err := core.CheckRestrictions(ctx, ec, common.HexToAddress(token), common.HexToAddress(from), common.HexToAddress(strings.TrimSpace(toE.Text)))
 		if err == nil && restr.Blocked() {
 			status.SetText("Rejected: " + restr.Summary()); spinner.Hide(); return
 		}
 
-		if ok, reason, _ := core.PreflightTransfer(ctx, ec, common.HexToAddress(token), common.HexToAddress(from), common.HexToAddress(to), w); !ok { status.SetText("Rejected: token not transferable (" + reason + ")"); spinner.Hide(); return }
-		pairs = append(pairs, pairRow{ Token: token, From: from, FromPK: fromPk, To: to, AmountTokens: amountTok, AmountWei: w.String(), Decimals: dec, BalanceWei: bal.String(), BalanceTokens: formatTokensFromWei(bal, dec) })
+		if ok, reason, err := core.PreflightTransfer(ctx, ec, common.HexToAddress(token), common.HexToAddress(from), common.HexToAddress(to), w); !ok {
+			if err != nil && isRPCTimeout(err) {
+				status.SetText("Preflight: RPC timeout — saving anyway")
+			} else {
+				status.SetText("Rejected: token not transferable (" + reason + ")"); spinner.Hide(); return
+			}
+		}
+		pairs = append(pairs, pairRow{
+			Token: token, From: from, FromPK: fromPk, To: to,
+			AmountWei: w.String(), AmountTokens: amountTok, Decimals: dec,
+			BalanceWei: bal.String(), BalanceTokens: formatTokensFromWei(bal, dec),
+		})
 		statsAdded++
 		saveQueueToFile()
-		status.SetText("Saved to queue ✔")
+		if strings.Contains(strings.ToLower(status.Text), "preflight: rpc timeout") {
+			status.SetText("Saved to queue ✔ (preflight skipped due to RPC timeout)")
+		} else {
+			status.SetText("Saved to queue ✔")
+		}
 		spinner.Hide()
 		win.Close()
 	})
@@ -455,11 +451,19 @@ func openAddPairWindow(a fyne.App, rpc string) {
 		widget.NewFormItem("To", toE),
 		widget.NewFormItem("Amount (tokens)", amountTokE),
 		widget.NewFormItem("Decimals", decE),
-		widget.NewFormItem("", container.NewHBox(checkBtn, saveBtn, cancelBtn)),
+		widget.NewFormItem("", container.NewHBox(saveBtn, cancelBtn)),
 	)
 	win.SetContent(container.NewVBox(form, statusCard))
 	win.Resize(fyne.NewSize(560, 520))
 	win.Show()
+}
+
+func closeAddPairWindows() {
+	addWinsMu.Lock()
+	ws := append([]fyne.Window(nil), addWins...)
+	addWins = nil
+	addWinsMu.Unlock()
+	for _, w := range ws { w.Close() }
 }
 
 func tryReadBPSAndTS(ec *ethclient.Client, token common.Address) (ok bool, maxTxBps, maxWalletBps uint64, totalSupply *big.Int) {
@@ -503,7 +507,8 @@ func buildEditForm(p *pairRow, onChange func()) fyne.CanvasObject {
 		fromAddr := from.Text; if strings.TrimSpace(fromAddr)=="" { fromAddr = addr }
 		d := -1; if strings.TrimSpace(dec.Text)!="" { if n,err := strconv.Atoi(dec.Text); err==nil { d = n } }
 		if d < 0 { d = 18 }
-		w, err := toWeiFromTokens(amountTok.Text, d); if err!=nil { status.SetText("amount: "+err.Error()); return }
+		amt := strings.ReplaceAll(strings.TrimSpace(amountTok.Text), ",", ".")
+		w, err := toWeiFromTokens(amt, d); if err!=nil { status.SetText("amount: "+err.Error()); return }
 		p.Token = token.Text; p.From = fromAddr; p.FromPK = fromPk.Text; p.To = to.Text; p.AmountTokens = amountTok.Text; p.Decimals = d; p.AmountWei = w.String()
 		onChange()
 	}

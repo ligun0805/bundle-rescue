@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -51,6 +52,7 @@ type Params struct {
 	BufferPct    int64
 	SimulateOnly bool
 	SkipIfPaused bool
+	Verbose      bool
 }
 
 type Result struct {
@@ -420,6 +422,7 @@ func Run(ctx context.Context, ec *ethclient.Client, p Params) (Result, error) {
 	safePrv, err := hexToECDSAPriv(p.SafePKHex); if err != nil { return Result{}, fmt.Errorf("safe pk: %w", err) }
 	fromPrv, err := hexToECDSAPriv(p.FromPKHex); if err != nil { return Result{}, fmt.Errorf("from pk: %w", err) }
 	authPrv, err := hexToECDSAPriv(p.AuthPrivHex); if err != nil { return Result{}, fmt.Errorf("auth pk: %w", err) }
+	safeAddr := gethcrypto.PubkeyToAddress(safePrv.PublicKey)
 
 	if p.SkipIfPaused {
 		if known, paused, _ := CheckPaused(ctx, ec, p.Token); known && paused {
@@ -468,7 +471,6 @@ for attempt := 0; attempt < p.Blocks; attempt++ {
 		return Result{Included:false, Reason:"competing nonce"}, nil
 	}
 	
-	safeAddr := gethcrypto.PubkeyToAddress(safePrv.PublicKey)
 	safeNonce, err := ec.PendingNonceAt(ctx, safeAddr); if err != nil { return Result{}, fmt.Errorf("nonce(safe): %w", err) }
 	safeBal, _ := ec.BalanceAt(ctx, safeAddr, nil)
 	p.logf("[balance] SAFE=%s ETH", fmtETH(safeBal))	
@@ -518,6 +520,15 @@ for attempt := 0; attempt < p.Blocks; attempt++ {
     prefundWei := new(big.Int).Mul(new(big.Int).SetUint64(gasTransfer+cancelGas), maxFee) 
     prefundWei = new(big.Int).Div(new(big.Int).Mul(prefundWei, big.NewInt(110)), big.NewInt(100))
 
+    safeFeeWei := new(big.Int).Mul(new(big.Int).SetUint64(21_000), maxFee)
+    needTotal := new(big.Int).Add(safeFeeWei, prefundWei)
+    safeBal, _ = ec.BalanceAt(ctx, safeAddr, nil)
+    if safeBal.Cmp(needTotal) < 0 {
+        p.logf("[abort] SAFE balance insufficient for fee+prefund at attempt %d/%d: need >= %s ETH, have %s ETH",
+            attempt+1, p.Blocks, fmtETH(needTotal), fmtETH(safeBal))
+        return Result{Included:false, Reason:"insufficient SAFE balance for fee+prefund"}, nil
+    }
+
     to1 := p.From
     tx1 := buildDynamicTx(p.ChainID, safeNonce, &to1, prefundWei, 21_000, tip, maxFee, nil)
     signed1, err := signTx(tx1, p.ChainID, safePrv); if err != nil { return Result{}, fmt.Errorf("sign safe: %w", err) }
@@ -541,69 +552,71 @@ for attempt := 0; attempt < p.Blocks; attempt++ {
     signedList = append(signedList, signed1) 
     if replaceMode { signedList = append(signedList, signedCancel) } 
     signedList = append(signedList, signed2) 
-
-    safeFeeWei := new(big.Int).Mul(new(big.Int).SetUint64(21_000), maxFee)
-	p.logf("[gas] transfer gas=%d, cancel=%d, maxFee=%s gwei (~%s ETH/gas)", gasTransfer, cancelGas, fmtGwei(maxFee), fmtETH(maxFee))
-	p.logf("[gas] SAFE needs >= %s ETH for its own fee; prefund=%s ETH", fmtETH(safeFeeWei), fmtETH(prefundWei))
+    p.logf("[gas] transfer gas=%d, cancel=%d, maxFee=%s gwei (~%s ETH/gas)", gasTransfer, cancelGas, fmtGwei(maxFee), fmtETH(maxFee))
+    p.logf("[gas] SAFE fee >= %s ETH; prefund=%s ETH (need total=%s ETH)",
+        fmtETH(safeFeeWei), fmtETH(prefundWei), fmtETH(needTotal))
 	p.logf("[attempt %d/%d] block=%s gas=%d(+%d) tip=%s gwei (~%s ETH/gas) feeCap=%s gwei (~%s ETH/gas) prefund=%s ETH nonce(safe=%d, from=%d)%s",
 		attempt+1, p.Blocks, targetBlock.String(),
 		gasTransfer, cancelGas, fmtGwei(tip), fmtETH(tip), fmtGwei(maxFee), fmtETH(maxFee), fmtETH(prefundWei),
 		safeNonce, fromNonce, map[bool]string{true:" (+replace)", false:""}[replaceMode],
 	)
-    p.logf("  tx1(fund safe->from): %s", txAsHex(signed1))
-    if replaceMode { p.logf("  tx2(cancel from->from): %s", txAsHex(signedCancel)) }
-    p.logf("  tx%v(transfer): %s", map[bool]int{true:3,false:2}[replaceMode], txAsHex(signed2))
+    if p.Verbose {
+        p.logf("  tx1(fund safe->from): %s", txAsHex(signed1))
+        if replaceMode { p.logf("  tx2(cancel from->from): %s", txAsHex(signedCancel)) }
+        p.logf("  tx%v(transfer): %s", map[bool]int{true:3,false:2}[replaceMode], txAsHex(signed2))
+    }
 
-		txHexes := make([]string, 0, len(signedList))
-		for _, t := range signedList { txHexes = append(txHexes, txAsHex(t)) }
+        txHexes := make([]string, 0, len(signedList))
+        for _, t := range signedList { txHexes = append(txHexes, txAsHex(t)) }
 
-		var simOK bool
-		var wgSim sync.WaitGroup
-		for _, rc := range classic {
-			rc := rc; wgSim.Add(1)
-			go func(){
-				defer wgSim.Done()
-				var resp *flashbots.CallBundleResponse
-				err2 := rc.C.Call(
-					flashbots.CallBundle(&flashbots.CallBundleRequest{
-						Transactions: signedList,
-						BlockNumber:  new(big.Int).Set(targetBlock),
-					}).Returns(&resp),
-				)
-				ok := (err2 == nil)
-				raw := ""; errStr := ""
-				if resp != nil {
-					b,_ := json.Marshal(resp); raw = string(b)
-					for _, r := range resp.Results {
-						if r.Error != nil || len(r.Revert)>0 {
-							ok = false
-							if r.Error != nil { errStr = r.Error.Error() } else { errStr = r.Revert }
-							break
-						}
-					}
-				}
-				if !ok && err2 != nil { errStr = err2.Error() }
-				if p.OnSimResult != nil { p.OnSimResult(rc.URL, raw, ok, errStr) }
-				if ok { simOK = true }
-			}()
-		}
-		for _, u := range matchmakers {
-			if p.OnSimResult != nil {
-				if raw, ok, err := simulateMevBundle(ctx, u, authPrv, txHexes, targetBlock); ok { p.OnSimResult(u, raw, err==nil, "") } else { p.OnSimResult(u, "", false, "simulation not supported on matchmaker") }
-			}
-		}
-		wgSim.Wait()
-
-		if !simOK {
-            p.logf("[attempt %d/%d] block=%s gas=%d(+%d) tip=%s gwei (~%s ETH/gas) feeCap=%s gwei (~%s ETH/gas) prefund=%s ETH nonce(safe=%d, from=%d)%s",
-                attempt+1, p.Blocks, targetBlock.String(),
-                gasTransfer, cancelGas, fmtGwei(tip), fmtETH(tip), fmtGwei(maxFee), fmtETH(maxFee), fmtETH(prefundWei),
-                safeNonce, fromNonce, map[bool]string{true:" (+replace)", false:""}[replaceMode])
-			curFromNonce2, _ := ec.NonceAt(ctx, p.From, nil)
-			if curFromNonce2 > startFromNonce { return Result{Included:false, Reason:"competing nonce"}, nil }
-			continue
-		}
-		if p.SimulateOnly { return Result{Included:false, Reason:"simulate only"}, nil }
+        if p.SimulateOnly {
+            var simOK atomic.Bool
+            var wgSim sync.WaitGroup
+            for _, rc := range classic {
+                rc := rc; wgSim.Add(1)
+                go func(){
+                    defer wgSim.Done()
+                    var resp *flashbots.CallBundleResponse
+                    err2 := rc.C.Call(
+                        flashbots.CallBundle(&flashbots.CallBundleRequest{
+                            Transactions: signedList,
+                            BlockNumber:  new(big.Int).Set(targetBlock),
+                        }).Returns(&resp),
+                    )
+                    ok := (err2 == nil)
+                    raw := ""; errStr := ""
+                    if resp != nil {
+                        b,_ := json.Marshal(resp); raw = string(b)
+                        for _, r := range resp.Results {
+                            if r.Error != nil || len(r.Revert)>0 {
+                                ok = false
+                                if r.Error != nil { errStr = r.Error.Error() } else { errStr = r.Revert }
+                                break
+                            }
+                        }
+                    }
+                    if !ok && err2 != nil { errStr = err2.Error() }
+                    if p.OnSimResult != nil { p.OnSimResult(rc.URL, raw, ok, errStr) }
+                    if ok { simOK.Store(true) }
+                }()
+            }
+            for _, u := range matchmakers {
+                if p.OnSimResult != nil {
+                    if raw, ok, err := simulateMevBundle(ctx, u, authPrv, txHexes, targetBlock); ok { p.OnSimResult(u, raw, err==nil, "") } else { p.OnSimResult(u, "", false, "simulation not supported on matchmaker") }
+                }
+            }
+            wgSim.Wait()
+            if !simOK.Load() {
+                p.logf("[attempt %d/%d] block=%s gas=%d(+%d) tip=%s gwei (~%s ETH/gas) feeCap=%s gwei (~%s ETH/gas) prefund=%s ETH nonce(safe=%d, from=%d)%s",
+                    attempt+1, p.Blocks, targetBlock.String(),
+                    gasTransfer, cancelGas, fmtGwei(tip), fmtETH(tip), fmtGwei(maxFee), fmtETH(maxFee), fmtETH(prefundWei),
+                    safeNonce, fromNonce, map[bool]string{true:" (+replace)", false:""}[replaceMode])
+                curFromNonce2, _ := ec.NonceAt(ctx, p.From, nil)
+                if curFromNonce2 > startFromNonce { return Result{Included:false, Reason:"competing nonce"}, nil }
+                continue
+            }
+            return Result{Included:false, Reason:"simulate only"}, nil
+        }
 		var wgSend sync.WaitGroup
 		for _, rc := range classic {
 			rc := rc; wgSend.Add(1)
@@ -630,7 +643,7 @@ for attempt := 0; attempt < p.Blocks; attempt++ {
 			}()
 		}
 		wgSend.Wait()
-        waitCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+        waitCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
         defer cancel()
         incl, reason, err := waitInclusionOrCompete(waitCtx, ec, p.From, startFromNonce, signedList[len(signedList)-1].Hash(), targetBlock)
         if err != nil {
@@ -644,14 +657,17 @@ for attempt := 0; attempt < p.Blocks; attempt++ {
 }
 
 func waitInclusionOrCompete(ctx context.Context, ec *ethclient.Client, from common.Address, startNonce uint64, ourTx2 common.Hash, targetBlock *big.Int) (bool, string, error) {
+	// Ждём, пока текущая высота достигнет целевого блока.
 	for {
 		select {
 		case <-ctx.Done():
 			return false, "timeout waiting block", ctx.Err()
 		default:
-			h, err := ec.HeaderByNumber(ctx, targetBlock)
-			if err == nil && h != nil && h.Number != nil && h.Number.Cmp(targetBlock) == 0 { goto CHECK }
-			time.Sleep(500 * time.Millisecond)
+			h, err := ec.HeaderByNumber(ctx, nil)
+			if err == nil && h != nil && h.Number != nil && h.Number.Cmp(targetBlock) >= 0 {
+				goto CHECK
+			}
+			time.Sleep(300 * time.Millisecond)
 		}
 	}
 CHECK:

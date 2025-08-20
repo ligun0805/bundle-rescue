@@ -32,6 +32,7 @@ func main() {
 	w.SetOnClosed(func(){
 		if viewWin != nil { viewWin.Close(); viewWin = nil }
 		if logWin  != nil { logWin.Close();  logWin  = nil }
+		closeAddPairWindows()
 	})
 	loadQueueFromFile()
 	w.Resize(fyne.NewSize(1180, 760))
@@ -82,7 +83,7 @@ func main() {
 		widget.NewFormItem("Buffer %", buffer),
 	))
 
-	addBtn := widget.NewButtonWithIcon("ADD PAIR", theme.ContentAddIcon(), func(){ openAddPairWindow(a, rpcEntry.Text) })
+	addBtn := widget.NewButtonWithIcon("ADD PAIR", theme.ContentAddIcon(), func(){ openAddPairWindow(a, rpcEntry.Text, safePkEntry.Text) })
 	importBtn := widget.NewButtonWithIcon("IMPORT PAIRS", theme.FolderOpenIcon(), func(){
 		dialog.NewFileOpen(func(rc fyne.URIReadCloser, err error){
 			if err!=nil || rc==nil { return }

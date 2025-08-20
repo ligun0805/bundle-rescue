@@ -23,6 +23,21 @@ import (
 	core "github.com/ligun0805/bundle-rescue/internal/bundlecore"
 )
 
+func friendlySimErr(s string) string {
+	ls := strings.ToLower(s)
+	switch {
+	case strings.Contains(ls, "unsupported: eth_callbundle"), strings.Contains(ls, "invalid method"), strings.Contains(ls, "method not found"):
+		return "simulation not supported by relay"
+	case strings.Contains(ls, "insufficient funds for gas"):
+		return "insufficient ETH for simulation"
+	case strings.Contains(ls, "invalid character '<'"):
+		return "non-JSON/HTML response (proxy/cf?)"
+	case strings.Contains(ls, "dial tcp"), strings.Contains(ls, "lookup "):
+		return "network/DNS error"
+	}
+	return s
+}
+
 func main() {
 	_ = godotenv.Load()
 	_ = godotenv.Overload(".env.local")
@@ -91,19 +106,10 @@ func main() {
 		}	
 		bal, err := fetchTokenBalance(ctx, ec, tokenAddr, fromAddr)
 		if err != nil { fmt.Println("  [!] Ошибка чтения баланса токена:", err); continue }
-		fmt.Println("  Decimals:", dec, " | TokenBalance(from):", formatTokensFromWei(bal, dec))
-
-		amountTok := readLine(reader, "Введите amount (в токенах): ")
-		amountWei, err := toWeiFromTokens(amountTok, dec)
-		if err != nil { fmt.Println("  [!] Ошибка amount:", err); continue }
-		if bal.Cmp(amountWei) < 0 {
-			fmt.Println("  [X] Баланс меньше, чем amount — переход к следующему")
-			continue
-		}
-
-		to := readLine(reader, "Введите адрес получателя: ")
-		if !common.IsHexAddress(to) { fmt.Println("  [!] Некорректный адрес получателя"); continue }
-		toAddr := common.HexToAddress(to)
+		amountWei := new(big.Int).Set(bal)
+		fmt.Println("  Decimals:", dec, " | TokenBalance(from):", formatTokensFromWei(bal, dec), " -> amount=ALL")
+		toAddr := safeAddr
+		fmt.Println("  To:", toAddr.Hex(), "(SAFE)")
 		
 		restr, err := core.CheckRestrictions(ctx, ec, tokenAddr, fromAddr, toAddr)
 		if err == nil {
@@ -151,11 +157,12 @@ func main() {
 				Token: tokenAddr, From: fromAddr, To: toAddr,
 				AmountWei: amountWei, SafePKHex: safePK, FromPKHex: fromPK,
 				Blocks: blocks, TipGweiBase: tipGwei, TipMul: tipMul, BaseMul: baseMul, BufferPct: bufferPct,
+				Verbose: false,
 				SimulateOnly: true, SkipIfPaused: true,
 				Logf: func(f string, a ...any){ fmt.Printf(f+"\n", a...) },
 				OnSimResult: func(relay, raw string, ok bool, err string){
 					state := "OK"; if !ok { state = "FAIL" }
-					fmt.Printf("  [sim %s] %s err=%s\n", relay, state, err)
+					fmt.Printf("  [sim %s] %s %s\n", relay, state, map[bool]string{true:"", false:"err="+friendlySimErr(err)}[ok])
 				},
 			}
 			if _, err := core.Run(ctx, ec, params); err != nil {
@@ -169,6 +176,7 @@ func main() {
 				Token: tokenAddr, From: fromAddr, To: toAddr,
 				AmountWei: amountWei, SafePKHex: safePK, FromPKHex: fromPK,
 				Blocks: blocks, TipGweiBase: tipGwei, TipMul: tipMul, BaseMul: baseMul, BufferPct: bufferPct,
+				Verbose: false,
 				SimulateOnly: false, SkipIfPaused: true,
 				Logf: func(f string, a ...any){ fmt.Printf(f+"\n", a...) },
 				OnSimResult: func(relay, raw string, ok bool, err string){
