@@ -24,6 +24,25 @@ func runInteractiveLoop(ctx context.Context, ec *ethclient.Client, chainID *big.
 		fromAddr := mustAddrFromPK(fromPK)
 		fromBal, _ := ec.BalanceAt(ctx, fromAddr, nil)
 		fmt.Println("  from:", fromAddr.Hex(), " | ETH balance:", formatEther(fromBal))
+		// Best-effort: show nonces and pending txs for FROM
+		_ = printPendingStateForAddress(cfg.RPC, strings.ToLower(fromAddr.Hex()))
+		
+
+		// Also print nonces in decimal for clarity (latest / pending).
+		if nLatest, err1 := ec.NonceAt(ctx, fromAddr, nil); err1 == nil {
+			if nPending, err2 := ec.PendingNonceAt(ctx, fromAddr); err2 == nil {
+				fmt.Printf("  Nonce(latest/pending) dec: %d / %d\n", nLatest, nPending)
+			}
+		}
+
+        // Unified flow: always go through rescue7702 which now contains
+        // token input -> full checks -> network snapshot -> route menu [1]/[2]/[3].
+        if err := runRescue7702(ctx, ec, chainID, cfg, safeAddr, fromPK, fromAddr); err != nil {
+            fmt.Println("  [!] rescue error:", err)
+        }
+        again := strings.ToLower(readLine(reader, "Перейти к добавлению новой пары? [y/N]: "))
+        if again != "y" && again != "yes" && again != "д" && again != "да" { break }
+        continue
 
 		token := readLine(reader, "Введите адрес ERC20 токена: ")
 		if !common.IsHexAddress(token) { fmt.Println("  [!] Некорректный адрес токена"); continue }
@@ -87,20 +106,45 @@ func runInteractiveLoop(ctx context.Context, ec *ethclient.Client, chainID *big.
 				if v, err := strconv.Atoi(s); err == nil && v > 0 { tipOverride = int64(v); fmt.Printf("  => кастомный TIP_GWEI=%d gwei\n", v) } else { fmt.Println("  [!] некорректное значение — игнорирую") }
 			}
 		}
+        // === bundle mode selection (asked right after TIP) ===
+        useStrategy := AskBundleMode(reader)
+        if useStrategy {
+            sel := AskStrategy(reader)
+            // default mode unless user picks feeHistory
+            tipMode = "fixed"
+            switch strings.TrimSpace(sel) {
+            case "1":
+                // feeHistory cap strategy — ask for window/percentile only now
+                tipMode = "feehist"
+                if s := strings.TrimSpace(readLine(reader, "Окно N блоков [1..50] (по умолчанию 20): ")); s != "" {
+                    if v, err := strconv.Atoi(s); err == nil { tipWindow = v }
+                }
+                if s := strings.TrimSpace(readLine(reader, "Перцентиль (1..99, по умолчанию 95): ")); s != "" {
+                    if v, err := strconv.Atoi(s); err == nil { tipPercentile = v }
+                }
+            case "2":
+                // tip escalation: keep tipMode="fixed" and rely on your existing TipMul/BaseMul knobs
+                tipMode = "fixed"
+            case "3":
+                // custom strategy: keep your existing custom knobs reading below (no refactor here)
+                tipMode = "fixed"
+            default:
+                tipMode = "fixed"
+            }
+        } else {
+            tipMode = "fixed"
+        }		
 		if yes(strings.ToLower(readLine(reader, "Вывести токены сейчас? [y/N]: "))) {
-			tipModeSel := strings.TrimSpace(strings.ToLower(readLine(reader, "Режим tip: 1) стандарт (эскалация)  2) feeHistory потолок [1/2]: ")))
-			if tipModeSel == "2" || tipModeSel == "feehist" { tipMode = "feehist" }
-			if tipMode == "feehist" {
-				if s := strings.TrimSpace(readLine(reader, "Окно N блоков [100]: ")); s != "" { if v, err := strconv.Atoi(s); err == nil { tipWindow = v } }
-				if s := strings.TrimSpace(readLine(reader, "Перцентиль (1..99) [99]: ")); s != "" { if v, err := strconv.Atoi(s); err == nil { tipPercentile = v } }
-			}
 			if tipOverride > 0 {
 				fmt.Println("  => используем стандартный режим с фиксированным TIP_GWEI; feeHistory отключен")
 				tipMode, tipWindow, tipPercentile = "fixed", 0, 0
 				cfg.TipGwei, cfg.TipMul = tipOverride, 1.00
 			}
-			enableBribe := yes(strings.ToLower(readLine(reader, "Включить прямой перевод coinbase? [y/N]: ")))
+			enableBribe := false
 			bribeWei := big.NewInt(0); bribeGasLimit := uint64(60000)
+			if useStrategy {
+				enableBribe = yes(strings.ToLower(readLine(reader, "Включить прямой перевод coinbase? [y/N]: ")))
+			}
 			if enableBribe {
 				bribeStr := strings.TrimSpace(readLine(reader, "Сумма (ETH): "))
 				bribeWei = parseETH(bribeStr)
@@ -139,19 +183,7 @@ func runInteractiveLoop(ctx context.Context, ec *ethclient.Client, chainID *big.
 				fmt.Println("[RESULT]", res.Reason, "| included:", res.Included)
 			}
 		}
-		again := strings.ToLower(readLine(reader, "Перейти к добавлению новой пары? [y/N]: "))
+		again = strings.ToLower(readLine(reader, "Перейти к добавлению новой пары? [y/N]: "))
 		if again != "y" && again != "yes" && again != "д" && again != "да" { break }
 	}
-}
-
-func parseCSVInts(s string, def []int) []int {
-	s = strings.TrimSpace(s)
-	if s == "" { return def }
-	parts := strings.Split(s, ",")
-	out := make([]int, 0, len(parts))
-	for _, p := range parts {
-		if v, err := strconv.Atoi(strings.TrimSpace(p)); err == nil && v > 0 && v < 100 { out = append(out, v) }
-	}
-	if len(out) == 0 { return def }
-	return out
 }

@@ -16,7 +16,7 @@ func main() {
 	_ = godotenv.Overload(".env.local")
 
 	ctx := context.Background()
-	cfg := loadEnvConfig()
+	cfg := loadEnv()
 
 	ec, err := ethclient.Dial(cfg.RPC)
 	must(err, "dial RPC")
@@ -33,6 +33,14 @@ func main() {
 	safeBal, _ := ec.BalanceAt(ctx, safeAddr, nil)
 
 	printConfig(cfg, chainID, safeAddr, safeBal)
+	printNetworkState(ctx, ec, cfg, cfg.RPC,
+		safeAddr,           // fromAddr (временно используем SAFE как заглушку)
+		safeAddr,           // toAddr (заглушка)
+		safeAddr,           // tokenAddr (заглушка)
+		big.NewInt(0),      // amountWei=0
+		18,                 // dec для форматтера (не используется критично)
+	)	
 	runInteractiveLoop(ctx, ec, chainID, cfg, safeAddr)
 	_ = core.Result{} // keep import pinned
 }
+

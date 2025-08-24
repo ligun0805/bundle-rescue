@@ -23,10 +23,6 @@ type pairRow struct {
 	BalanceWei, BalanceTokens string
 }
 
-func short(s string) string {
-	if len(s) <= 16 { return s }
-	return s[:10] + "…" + s[len(s)-5:]
-}
 func mustBig(s string) *big.Int {
 	s = strings.TrimSpace(s)
 	if s == "" { return big.NewInt(0) }

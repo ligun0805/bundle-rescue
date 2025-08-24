@@ -25,4 +25,23 @@ func readPassword(prompt string) string {
 
 func yes(s string) bool { return s=="y" || s=="yes" || s=="д" || s=="да" }
 func maskHex(h string) string { h=strings.TrimSpace(h); if len(h)<=10 { return "***" }; return h[:6]+"…"+h[len(h)-4:] }
-func truncate(s string, n int) string { if len(s)<=n { return s }; return s[:n] + "…(truncated)" }
+
+// AskBundleMode asks user whether to run plain bundle or apply strategy.
+// Returns true when user chose to apply a strategy.
+func AskBundleMode(r *bufio.Reader) bool {
+    fmt.Print("Режим бандла: 1) стандартный бандл  2) применить стратегию [1/2]: ")
+    s, _ := r.ReadString('\n')
+    s = strings.TrimSpace(s)
+    return s == "2"
+}
+
+// AskStrategy lets user pick a concrete strategy; return code as string.
+func AskStrategy(r *bufio.Reader) string {
+    fmt.Println("Выберите стратегию:")
+    fmt.Println("  1) feeHistory потолок")
+    fmt.Println("  2) эскалация по tip (стандарт)")
+    fmt.Println("  3) кастом (ввести вручную)")
+    fmt.Print("Ваш выбор [1/2/3]: ")
+    s, _ := r.ReadString('\n')
+    return strings.TrimSpace(s)
+}

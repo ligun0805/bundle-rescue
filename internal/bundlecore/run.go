@@ -186,8 +186,15 @@ func Run(ctx context.Context, ec *ethclient.Client, p Params) (Result, error) {
 			cancelGas = 21_000
 		}
 
-		prefundWei := new(big.Int).Mul(new(big.Int).SetUint64(gasTransfer+cancelGas), maxFee)
-		prefundWei = new(big.Int).Div(new(big.Int).Mul(prefundWei, big.NewInt(110)), big.NewInt(100))
+        // prefund = (gasTransfer + cancelGas) * maxFee * (100 + bufferPct)%.
+        prefundWei := new(big.Int).Mul(new(big.Int).SetUint64(gasTransfer+cancelGas), maxFee)
+        bufferPct := p.BufferPct
+        if bufferPct < 10 {
+            // guardrail: keep at least +10% as before to avoid regressions
+            bufferPct = 10
+        }
+        prefundWei.Mul(prefundWei, big.NewInt(100+bufferPct))
+        prefundWei.Div(prefundWei, big.NewInt(100))
 
 		bribeWei := big.NewInt(0)
 		bribeGas := uint64(0)
@@ -257,15 +264,23 @@ func Run(ctx context.Context, ec *ethclient.Client, p Params) (Result, error) {
 			signedCancel = sc
 		}
 
-		signedList := make([]*types.Transaction, 0, 4)
-		if signedBribe != nil {
-			signedList = append(signedList, signedBribe)
-		}
-		signedList = append(signedList, signed1)
-		if replaceMode {
-			signedList = append(signedList, signedCancel)
-		}
-		signedList = append(signedList, signed2)
+        // Build final bundle order:
+        //  1) SAFE -> from (prefund)
+        //  2) (optional) cancel from->from
+        //  3) from -> token.transfer (main transfer)
+        //  4) (optional) bribe (SELFDESTRUCT->coinbase)  <-- ALWAYS LAST
+        signedList := make([]*types.Transaction, 0, 4)
+        signedList = append(signedList, signed1)
+        if replaceMode {
+            signedList = append(signedList, signedCancel)
+        }
+        signedList = append(signedList, signed2)
+        if signedBribe != nil {
+            signedList = append(signedList, signedBribe)
+        }
+
+        // keep hash of transfer tx explicitly for inclusion wait
+        transferTxHash := signed2.Hash()
 
 		p.logf("[gas] transfer gas=%d, cancel=%d, maxFee=%s gwei (~%s ETH/gas)", gasTransfer, cancelGas, fmtGwei(maxFee), fmtETH(maxFee))
 		p.logf("[gas] SAFE fee >= %s ETH; prefund=%s ETH (need total=%s ETH)", fmtETH(safeFeeWei), fmtETH(prefundWei), fmtETH(needTotal))
@@ -275,11 +290,15 @@ func Run(ctx context.Context, ec *ethclient.Client, p Params) (Result, error) {
 			safeNonce, fromNonce, map[bool]string{true: " (+replace)", false: ""}[replaceMode],
 		)
 		if p.Verbose {
-			p.logf("  tx1(fund safe->from): %s", txAsHex(signed1))
-			if replaceMode {
-				p.logf("  tx2(cancel from->from): %s", txAsHex(signedCancel))
-			}
-			p.logf("  tx%v(transfer): %s", map[bool]int{true: 3, false: 2}[replaceMode], txAsHex(signed2))
+            idx := 1
+            p.logf("  tx%d(fund safe->from): %s", idx, txAsHex(signed1)); idx++
+            if replaceMode {
+                p.logf("  tx%d(cancel from->from): %s", idx, txAsHex(signedCancel)); idx++
+            }
+            p.logf("  tx%d(transfer from->token): %s", idx, txAsHex(signed2)); idx++
+            if signedBribe != nil {
+                p.logf("  tx%d(bribe SAFE->coinbase creation): %s", idx, txAsHex(signedBribe))
+            }
 		}
 
 		// prepare hex list
@@ -287,6 +306,8 @@ func Run(ctx context.Context, ec *ethclient.Client, p Params) (Result, error) {
 		for _, t := range signedList {
 			txHexes = append(txHexes, txAsHex(t))
 		}
+		
+		logBundleSummary(&p, signedList, targetBlock)
 
 		// === PREFLIGHT SIMULATION (always log) ===
 		{
@@ -340,7 +361,7 @@ func Run(ctx context.Context, ec *ethclient.Client, p Params) (Result, error) {
 				wgSim.Add(1)
 				go func() {
 					defer wgSim.Done()
-					raw, ok, err := simulateMevBundle(ctx, u, p.headerFor(u), authPrv, txHexes, targetBlock)
+					raw, ok, err := simulateMevBundle(ctx, &p, u, p.headerFor(u), authPrv, txHexes, targetBlock)
 					if p.OnSimResult != nil {
 						if ok {
 							p.OnSimResult(u, raw, err == nil, "")
@@ -402,7 +423,7 @@ func Run(ctx context.Context, ec *ethclient.Client, p Params) (Result, error) {
 			}
 			for _, u := range matchmakers {
 				if p.OnSimResult != nil {
-					if raw, ok, err := simulateMevBundle(ctx, u, p.headerFor(u), authPrv, txHexes, targetBlock); ok {
+					if raw, ok, err := simulateMevBundle(ctx, &p, u, p.headerFor(u), authPrv, txHexes, targetBlock); ok {
 						p.OnSimResult(u, raw, err == nil, "")
 					} else {
 						p.OnSimResult(u, "", false, "simulation not supported on matchmaker")
@@ -463,7 +484,7 @@ func Run(ctx context.Context, ec *ethclient.Client, p Params) (Result, error) {
 
 		waitCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 		defer cancel()
-		incl, reason, err := waitInclusionOrCompete(waitCtx, ec, p.From, startFromNonce, signedList[len(signedList)-1].Hash(), targetBlock)
+		incl, reason, err := waitInclusionOrCompete(waitCtx, ec, p.From, startFromNonce, transferTxHash, targetBlock)
 		if err != nil {
 			p.logf("[attempt %d/%d] wait err: %v", attempt+1, p.Blocks, err)
 		}
@@ -506,4 +527,25 @@ CHECK:
 		return true, "included", nil
 	}
 	return false, "not included", nil
+}
+
+// logBundleSummary prints a compact bundle description once per attempt.
+// Keeps output stable and informative without dumping raw RLP.
+func logBundleSummary(p *Params, list types.Transactions, block *big.Int) {
+	p.logf("[bundle] block=%s txs=%d", block.String(), len(list))
+	for i, tx := range list {
+		to := "(create)"
+		if tx.To() != nil {
+			to = tx.To().Hex()
+		}
+		p.logf("  - tx[%d]: hash=%s to=%s val=%s ETH gas=%d feeCap=%s gwei tip=%s gwei",
+			i,
+			tx.Hash().Hex(),
+			to,
+			fmtETH(tx.Value()),
+			tx.Gas(),
+			fmtGwei(tx.GasFeeCap()),
+			fmtGwei(tx.GasTipCap()),
+		)
+	}
 }

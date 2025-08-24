@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/big"
+	"net/http"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
@@ -85,4 +89,59 @@ func tryReadBPSAndTS(ctx context.Context, ec *ethclient.Client, token Address) (
 		return true, mt.Uint64(), mw.Uint64(), ts
 	}
 	return false, 0, 0, nil
+}
+
+
+// printPendingStateForAddress prints latest/pending nonces and up to 10 pending txs from txpool (if supported).
+// It degrades gracefully when the RPC does not expose txpool_* methods.
+func printPendingStateForAddress(rpcURL, fromHexLower string) error {
+	// tiny JSON-RPC helpers
+	type rpcReq struct {
+		Jsonrpc string        `json:"jsonrpc"`
+		ID      int           `json:"id"`
+		Method  string        `json:"method"`
+		Params  []interface{} `json:"params"`
+	}
+	type rpcResp struct {
+		Result interface{} `json:"result"`
+		Error  *struct{ Message string `json:"message"` } `json:"error"`
+	}
+	call := func(method string, params []interface{}) (rpcResp, error) {
+		body, _ := json.Marshal(rpcReq{Jsonrpc: "2.0", ID: 1, Method: method, Params: params})
+		req, _ := http.NewRequest("POST", rpcURL, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil { return rpcResp{}, err }
+		defer resp.Body.Close()
+		var out rpcResp
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil { return rpcResp{}, err }
+		if out.Error != nil { return out, fmt.Errorf(out.Error.Message) }
+		return out, nil
+	}
+	latest, _ := call("eth_getTransactionCount", []interface{}{fromHexLower, "latest"})
+	pending, _ := call("eth_getTransactionCount", []interface{}{fromHexLower, "pending"})
+	fmt.Printf("  Nonce(latest/pending): %v / %v\n", latest.Result, pending.Result)
+	// Try txpool_content (Infura/Alchemy обычно закрывают — просто молча пропускаем)
+	pool, err := call("txpool_content", nil)
+	if err != nil { return nil }
+	m, ok := pool.Result.(map[string]interface{}); if !ok { return nil }
+	pend, _ := m["pending"].(map[string]interface{}); if pend == nil { return nil }
+	addrMap, _ := pend[fromHexLower].(map[string]interface{}); if addrMap == nil { return nil }
+	fmt.Println("  Pending txs in txpool for FROM:")
+	shown := 0
+	for nonceKey, arr := range addrMap {
+		list, _ := arr.(map[string]interface{})
+		for _, v := range list {
+			txObj, _ := v.(map[string]interface{})
+			hash, _ := txObj["hash"].(string)
+			to, _ := txObj["to"].(string)
+			gas, _ := txObj["gas"].(string)
+			feeCap, _ := txObj["maxFeePerGas"].(string)
+			fmt.Printf("    • nonce=%s hash=%s to=%s gas=%s feeCap=%s\n", nonceKey, hash, to, gas, feeCap)
+			shown++
+			if shown >= 10 { fmt.Println("    … truncated"); return nil }
+		}
+	}
+	return nil
 }
