@@ -20,7 +20,8 @@ func runInteractiveLoop(ctx context.Context, ec *ethclient.Client, chainID *big.
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Println("\n--- Ввод пары (compromised -> token -> amount -> to) ---")
-		fromPK := readPassword("Введите приватный ключ скомпрометированного адреса: ")
+		fromPK := strings.TrimSpace(cfg.FromPK)
+		if fromPK == "" { die("FROM_PRIVATE_KEY (or COMPROMISED_PRIVATE_KEY) is empty in env") }
 		fromAddr := mustAddrFromPK(fromPK)
 		fromBal, _ := ec.BalanceAt(ctx, fromAddr, nil)
 		fmt.Println("  from:", fromAddr.Hex(), " | ETH balance:", formatEther(fromBal))

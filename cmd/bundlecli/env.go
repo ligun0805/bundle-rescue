@@ -13,6 +13,7 @@ type EnvConfig struct {
 	RelaysCSV   string
 	AuthPK      string
 	SafePK      string
+	FromPK      string
 	Blocks      int
 	TipGwei     int64
 	TipMul      float64
@@ -39,6 +40,7 @@ func loadEnv() EnvConfig {
     }
 	authPK := getenv("FLASHBOTS_AUTH_PK", "")
 	safePK := getenv("SAFE_PRIVATE_KEY", "")
+	fromPK := getenv("FROM_PRIVATE_KEY", getenv("COMPROMISED_PRIVATE_KEY", ""))
 	blocks := atoi(getenv("BLOCKS", "6"), 6)
 	tipGwei := atoi64(getenv("TIP_GWEI", "3"), 3)
 	tipMul := atof(getenv("TIP_MUL", "1.25"), 1.25)
@@ -53,7 +55,7 @@ func loadEnv() EnvConfig {
 	netBlocks := atoi(getenv("NETCHECK_BLOCKS", "100"), 100)
 	netPcts := parseCSVInts(getenv("NETCHECK_PCTS", "50,95,99"), []int{50, 95, 99})
 	return EnvConfig{
-		RPC: rpc, ChainIDStr: chainIDStr, RelaysCSV: relays, AuthPK: authPK, SafePK: safePK,
+		RPC: rpc, ChainIDStr: chainIDStr, RelaysCSV: relays, AuthPK: authPK, SafePK: safePK, FromPK: fromPK,
 		Blocks: blocks, TipGwei: tipGwei, TipMul: tipMul, BaseMul: baseMul, BufferPct: bufferPct,
 		DelegateHex: delegateHex,
 		Builders: builders, MinTs: minTs, MaxTs: maxTs,
