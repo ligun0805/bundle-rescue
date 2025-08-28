@@ -141,6 +141,17 @@ func runRescue7702(ctx context.Context, ec *ethclient.Client, chainID *big.Int, 
 	if route == "" { route = "3" }
 	switch route {
 	case "3":
+		// EIP-7702: require non-zero token balance on FROM, else fail explicitly
+		allZero := true
+		for _, t := range tokenAddrs {
+			if bal, err := fetchTokenBalance(ctx, ec, t, compromisedAddr); err == nil && bal != nil && bal.Sign() > 0 {
+				allZero = false
+				break
+			}
+		}
+		if allZero {
+			return fmt.Errorf("token balance is zero")
+		}
 		// continue with EIP-7702 flow below
 	case "1", "2":
 		// Execute classic bundle inline (no code duplication, reuse core.Params like in params_build.go)
