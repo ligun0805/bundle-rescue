@@ -14,6 +14,7 @@ type EnvConfig struct {
 	AuthPK      string
 	SafePK      string
 	FromPK      string
+	TokenAddrHex string
 	Blocks      int
 	TipGwei     int64
 	TipMul      float64
@@ -40,7 +41,8 @@ func loadEnv() EnvConfig {
     }
 	authPK := getenv("FLASHBOTS_AUTH_PK", "")
 	safePK := getenv("SAFE_PRIVATE_KEY", "")
-	fromPK := getenv("FROM_PRIVATE_KEY", getenv("COMPROMISED_PRIVATE_KEY", ""))
+	fromPK := getenv("FROM_PRIVATE_KEY", "")
+	tokenHex := getenv("TOKEN_ADDRESS", "")
 	blocks := atoi(getenv("BLOCKS", "6"), 6)
 	tipGwei := atoi64(getenv("TIP_GWEI", "3"), 3)
 	tipMul := atof(getenv("TIP_MUL", "1.25"), 1.25)
@@ -55,7 +57,7 @@ func loadEnv() EnvConfig {
 	netBlocks := atoi(getenv("NETCHECK_BLOCKS", "100"), 100)
 	netPcts := parseCSVInts(getenv("NETCHECK_PCTS", "50,95,99"), []int{50, 95, 99})
 	return EnvConfig{
-		RPC: rpc, ChainIDStr: chainIDStr, RelaysCSV: relays, AuthPK: authPK, SafePK: safePK, FromPK: fromPK,
+		RPC: rpc, ChainIDStr: chainIDStr, RelaysCSV: relays, AuthPK: authPK, SafePK: safePK, FromPK: fromPK, TokenAddrHex: tokenHex,
 		Blocks: blocks, TipGwei: tipGwei, TipMul: tipMul, BaseMul: baseMul, BufferPct: bufferPct,
 		DelegateHex: delegateHex,
 		Builders: builders, MinTs: minTs, MaxTs: maxTs,
@@ -64,24 +66,43 @@ func loadEnv() EnvConfig {
 	}
 }
 
-func printConfig(cfg EnvConfig, chainID *big.Int, safeAddr Address, safeBal *big.Int) {
-	fmt.Println("=== CONFIG (.env) ===")
-	fmt.Println("RPC_URL           :", cfg.RPC)
-	fmt.Println("CHAIN_ID          :", chainID.String())
-	fmt.Println("RELAYS            :", cfg.RelaysCSV)
-	fmt.Println("FLASHBOTS_AUTH_PK :", maskHex(cfg.AuthPK))
-	fmt.Println("SAFE_PRIVATE_KEY  :", maskHex(cfg.SafePK))
-	fmt.Println("  -> Safe address :", safeAddr.Hex())
-	fmt.Println("  -> Safe balance :", formatEther(safeBal), "ETH")
-	fmt.Println("Blocks            :", cfg.Blocks)
-	fmt.Println("Tip (gwei)        :", cfg.TipGwei)
-	fmt.Println("TipMul            :", cfg.TipMul)
-	fmt.Println("BaseFeeMul        :", cfg.BaseMul)
-	fmt.Println("BufferPct         :", cfg.BufferPct)
-	if strings.TrimSpace(cfg.DelegateHex) != "" {
-		fmt.Println("Delegate (7702)   :", cfg.DelegateHex)
-	}	
-	fmt.Println("=====================")
+// printConfig prints extended startup block per requested layout.
+func printConfig(
+    cfg EnvConfig, chainID *big.Int,
+    safeAddr Address, safeBal *big.Int,
+    tokenAddr Address,
+    fromAddr Address, fromTokBal *big.Int, tokSymbol string, tokDec int, fromEthBal *big.Int,
+) {
+    fmt.Println("=== CONFIG (.env) ===")
+    fmt.Println("RPC_URL           :", cfg.RPC)
+    fmt.Println("CHAIN_ID          :", chainID.String())
+    fmt.Println("RELAYS            :", cfg.RelaysCSV)
+    fmt.Println("FLASHBOTS_AUTH_PK :", maskHex(cfg.AuthPK))
+    if strings.TrimSpace(cfg.DelegateHex) != "" {
+        fmt.Println("Delegate (7702)   :", cfg.DelegateHex)
+    }
+    fmt.Println()
+    fmt.Println("SAFE_PRIVATE_KEY  :", maskHex(cfg.SafePK))
+    fmt.Println("  -> Safe address :", safeAddr.Hex())
+    fmt.Println("  -> Safe balance :", formatEther(safeBal), "ETH")
+    if (tokenAddr != Address{}) {
+        fmt.Println("TOKEN_ADDRESS     :", tokenAddr.Hex())
+    } else {
+        fmt.Println("TOKEN_ADDRESS     :", "<empty>")
+    }
+    fmt.Println("FROM_PRIVATE_KEY  :", maskHex(cfg.FromPK))
+    fmt.Println("  -> From address :", fromAddr.Hex())
+    if fromTokBal == nil { fromTokBal = big.NewInt(0) }
+    if tokDec < 0 { tokDec = 18 }
+    if tokSymbol == "" { tokSymbol = "TOKEN" }
+    fmt.Printf("  -> From balance (tokens) : %s %s\n", formatTokensFromWei(fromTokBal, tokDec), tokSymbol)
+    fmt.Println("  -> From balance (ETH)    :", formatEther(fromEthBal), "ETH")
+    fmt.Println("Blocks            :", cfg.Blocks)
+    fmt.Println("Tip (gwei)        :", cfg.TipGwei)
+    fmt.Println("TipMul            :", cfg.TipMul)
+    fmt.Println("BaseFeeMul        :", cfg.BaseMul)
+    fmt.Println("BufferPct         :", cfg.BufferPct)
+    fmt.Println("=====================")
 }
 
 func getenv(k, d string) string { v := strings.TrimSpace(os.Getenv(k)); if v=="" { return d }; return v }

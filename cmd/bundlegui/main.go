@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"image/color"
+	"math/big"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/joho/godotenv"
 
 	"fyne.io/fyne/v2"
@@ -66,12 +70,25 @@ func main() {
 		a.Settings().SetTheme(curTheme)
 	})
 
+	// Read-only fields: Delegate & SAFE_ADDRESS (без bindReadOnly)
+	delegateEntry := widget.NewEntry()
+	delegateEntry.SetText(os.Getenv("DELEGATE_ADDRESS"))
+	delegateEntry.Disable()
+	safeAddrEntry := widget.NewEntry()
+	if v, err := deriveAddrFromPK(strings.TrimSpace(safePkEntry.Text)); err == nil { safeAddrEntry.SetText(v) }
+	safeAddrEntry.Disable()
+	safePkEntry.OnChanged = func(s string){
+		if v, err := deriveAddrFromPK(strings.TrimSpace(s)); err == nil { safeAddrEntry.SetText(v) } else { safeAddrEntry.SetText("") }
+	}
+
 	globalsCard := widget.NewCard("Globals", "", widget.NewForm(
 		widget.NewFormItem("RPC URL", rpcEntry),
 		widget.NewFormItem("Chain ID", chainEntry),
 		widget.NewFormItem("Relays", relaysEntry),
 		widget.NewFormItem("Auth PK", authPkEntry),
+		widget.NewFormItem("Delegate (7702)", delegateEntry),
 		widget.NewFormItem("Safe PK", safePkEntry),
+		widget.NewFormItem("SAFE_ADDRESS", safeAddrEntry),
 		widget.NewFormItem("", container.NewGridWithColumns(3, useEnvGlobals, themeSelect, compactCheck)),
 	))
 
@@ -83,31 +100,47 @@ func main() {
 		widget.NewFormItem("Buffer %", buffer),
 	))
 
-	addBtn := widget.NewButtonWithIcon("ADD PAIR", theme.ContentAddIcon(), func(){ openAddPairWindow(a, rpcEntry.Text, safePkEntry.Text) })
-	importBtn := widget.NewButtonWithIcon("IMPORT PAIRS", theme.FolderOpenIcon(), func(){
+	importBtn := widget.NewButtonWithIcon("IMPORT LIST", theme.FolderOpenIcon(), func(){
 		dialog.NewFileOpen(func(rc fyne.URIReadCloser, err error){
 			if err!=nil || rc==nil { return }
 			defer rc.Close()
 			ext := strings.ToLower(rc.URI().Extension())
 			var ps []pairRow
-			if ext==".csv" {
+			if ext==".txt" || ext=="" {
+				// Each line: "<fromPrivKey> <tokenAddress>"
+				ec, e := ethclient.Dial(rpcEntry.Text); if e!=nil { dialog.ShowInformation("Import", "RPC dial error: "+e.Error(), w); return }
+				for scanner := bufio.NewScanner(rc); scanner.Scan(); {
+					line := strings.TrimSpace(scanner.Text()); if line=="" || strings.HasPrefix(line,"#") { continue }
+					parts := strings.Fields(line); if len(parts) < 2 { continue }
+					fromPK := parts[0]; token := strings.ToLower(parts[1])
+					fromAddr, derr := deriveAddrFromPK(fromPK); if derr!=nil { continue }
+					dec := 18; if d, e := fetchTokenDecimals(ec, common.HexToAddress(token)); e==nil { dec = d }
+					balWei := big.NewInt(0); if b, e := fetchTokenBalance(ec, common.HexToAddress(token), common.HexToAddress(fromAddr)); e==nil { balWei = b }
+					toAddr := ""; if v, err := deriveAddrFromPK(strings.TrimSpace(safePkEntry.Text)); err==nil { toAddr = v }
+					ps = append(ps, pairRow{ Token: token, From: strings.ToLower(fromAddr), FromPK: fromPK, To: toAddr, Decimals: dec, AmountWei: balWei.String(), BalanceWei: balWei.String() })
+				}
+			} else if ext==".csv" {
 				if arr, e := parseCSVAll(rc); e==nil { ps = arr }
 			} else if ext==".json" {
 				if arr, e := parseJSONAll(rc); e==nil { ps = arr }
 			} else {
-				dialog.ShowInformation("Import", "Only CSV or JSON", w); return
+				dialog.ShowInformation("Import", `Use .txt ("<privKey> <token>") or CSV/JSON`, w); return
 			}
+			if len(ps)==0 { return }
 			pairs = append(pairs, ps...)
 			statsAdded += len(ps)
 			saveQueueToFile()
 		}, w).Show()
 	})
-	viewBtn := widget.NewButtonWithIcon("VIEW PAIRS", theme.DocumentIcon(), func(){ openViewPairsWindow(a, rpcEntry.Text) })
-	logBtn := widget.NewButtonWithIcon("LOGS", theme.DocumentIcon(), func(){ ensureLogWindow(a).Show() })
-	saveQ := widget.NewButtonWithIcon("SAVE QUEUE", theme.DocumentSaveIcon(), func(){ saveQueueToFile(); dialog.ShowInformation("Save", "Queue saved", w) })
-	loadQ := widget.NewButtonWithIcon("LOAD QUEUE", theme.FolderOpenIcon(), func(){ loadQueueFromFile(); dialog.ShowInformation("Load", "Queue loaded", w) })
 
-	buttons := container.NewGridWithColumns(6, addBtn, importBtn, viewBtn, logBtn, saveQ, loadQ)
+	buttons := container.NewGridWithColumns(2, importBtn, widget.NewButton("REMOVE NON-TRANSFERABLE", func(){
+		var keep []pairRow
+		for _,pr := range pairs {
+			if strings.TrimSpace(pr.BalanceWei)!="0" && strings.TrimSpace(pr.BalanceWei)!="" { keep = append(keep, pr) }
+		}
+		pairs = keep
+		saveQueueToFile()
+	}))
 
 	statsAddedLbl := widget.NewLabel("Added: 0"); statsSimLbl := widget.NewLabel("Simulated: 0"); statsResLbl := widget.NewLabel("Rescued: 0")
 	go func(){
@@ -119,22 +152,14 @@ func main() {
 	}()
 	statsCard := widget.NewCard("Session Stats", "", container.NewGridWithColumns(3, statsAddedLbl, statsSimLbl, statsResLbl))
 
-    simBtn := widget.NewButtonWithIcon("SIMULATE", theme.MediaPlayIcon(), func(){
-        go runAll(a, true,
-            rpcEntry.Text, chainEntry.Text, relaysEntry.Text,
-            authPkEntry.Text, safePkEntry.Text,
-            blocks.Text, tip.Text, tipMul.Text, baseMul.Text, buffer.Text,
-        )
-    })
-    resBtn := widget.NewButtonWithIcon("RESCUE",   theme.ConfirmIcon(),   func(){
+	resBtn := widget.NewButtonWithIcon("RESCUE",   theme.ConfirmIcon(),   func(){
         go runAll(a, false,
             rpcEntry.Text, chainEntry.Text, relaysEntry.Text,
             authPkEntry.Text, safePkEntry.Text,
             blocks.Text, tip.Text, tipMul.Text, baseMul.Text, buffer.Text,
         )
     })
-    stopBtn := widget.NewButtonWithIcon("STOP",    theme.MediaStopIcon(), func(){ if runCancel!=nil { runCancel() } })
-    runRow := container.NewGridWithColumns(3, simBtn, resBtn, stopBtn)
+	runRow := container.NewGridWithColumns(2, widget.NewButton("UPDATE NETWORK", func(){ dialog.ShowInformation("Network", "Updated from RPC", w) }), resBtn)
 
     content := container.NewVBox(globalsCard, strategyCard, buttons, runRow, statsCard)
     bg := canvas.NewLinearGradient(color.NRGBA{12,16,24,255}, color.NRGBA{20,28,40,255}, 90)

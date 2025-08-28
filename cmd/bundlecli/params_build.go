@@ -18,21 +18,23 @@ import (
 // runInteractiveLoop keeps the original REPL-style flow but split into smaller steps.
 func runInteractiveLoop(ctx context.Context, ec *ethclient.Client, chainID *big.Int, cfg EnvConfig, safeAddr Address) {
 	reader := bufio.NewReader(os.Stdin)
+	singleTokenMode := strings.TrimSpace(cfg.TokenAddrHex) != ""
 	for {
-		fmt.Println("\n--- Ввод пары (compromised -> token -> amount -> to) ---")
+		// Печатаем заголовок «Ввод пары…» только если токен не задан в .env
+		if !singleTokenMode {
+			fmt.Println("\n--- Ввод пары (compromised -> token -> amount -> to) ---")
+		}
 		fromPK := strings.TrimSpace(cfg.FromPK)
 		if fromPK == "" { die("FROM_PRIVATE_KEY (or COMPROMISED_PRIVATE_KEY) is empty in env") }
 		fromAddr := mustAddrFromPK(fromPK)
-		fromBal, _ := ec.BalanceAt(ctx, fromAddr, nil)
-		fmt.Println("  from:", fromAddr.Hex(), " | ETH balance:", formatEther(fromBal))
-		// Best-effort: show nonces and pending txs for FROM
-		_ = printPendingStateForAddress(cfg.RPC, strings.ToLower(fromAddr.Hex()))
-		
-
-		// Also print nonces in decimal for clarity (latest / pending).
-		if nLatest, err1 := ec.NonceAt(ctx, fromAddr, nil); err1 == nil {
-			if nPending, err2 := ec.PendingNonceAt(ctx, fromAddr); err2 == nil {
-				fmt.Printf("  Nonce(latest/pending) dec: %d / %d\n", nLatest, nPending)
+		if !singleTokenMode {
+			fromBal, _ := ec.BalanceAt(ctx, fromAddr, nil)
+			fmt.Println("  from:", fromAddr.Hex(), " | ETH balance:", formatEther(fromBal))
+			_ = printPendingStateForAddress(cfg.RPC, strings.ToLower(fromAddr.Hex()))
+			if nLatest, err1 := ec.NonceAt(ctx, fromAddr, nil); err1 == nil {
+				if nPending, err2 := ec.PendingNonceAt(ctx, fromAddr); err2 == nil {
+					fmt.Printf("  Nonce(latest/pending) dec: %d / %d\n", nLatest, nPending)
+				}
 			}
 		}
 
@@ -40,9 +42,16 @@ func runInteractiveLoop(ctx context.Context, ec *ethclient.Client, chainID *big.
         // token input -> full checks -> network snapshot -> route menu [1]/[2]/[3].
         if err := runRescue7702(ctx, ec, chainID, cfg, safeAddr, fromPK, fromAddr); err != nil {
             fmt.Println("  [!] rescue error:", err)
+            // On error: go back to the scenario menu (no extra prompts).
+            continue
         }
-        again := strings.ToLower(readLine(reader, "Перейти к добавлению новой пары? [y/N]: "))
-        if again != "y" && again != "yes" && again != "д" && again != "да" { break }
+        // On success: ask whether to exit or return to the scenario menu.
+        // Default = stay (so окно не закрывается само после 7702).
+        ans := strings.ToLower(strings.TrimSpace(readLine(reader, "Готово. Выйти из приложения? [y/N]: ")))
+        if ans == "y" || ans == "yes" || ans == "да" {
+            break // exit explicitly on Yes
+        }
+        // Any other answer (incl. ENTER) => back to the scenario menu
         continue
 
 		token := readLine(reader, "Введите адрес ERC20 токена: ")
@@ -184,7 +193,7 @@ func runInteractiveLoop(ctx context.Context, ec *ethclient.Client, chainID *big.
 				fmt.Println("[RESULT]", res.Reason, "| included:", res.Included)
 			}
 		}
-		again = strings.ToLower(readLine(reader, "Перейти к добавлению новой пары? [y/N]: "))
-		if again != "y" && again != "yes" && again != "д" && again != "да" { break }
+        again := strings.ToLower(readLine(reader, "Перейти к добавлению новой пары? [y/N]: "))
+        if again != "y" && again != "yes" && again != "д" && again != "да" { break }
 	}
 }

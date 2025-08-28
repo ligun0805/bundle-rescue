@@ -43,15 +43,6 @@ func printNetworkState(ctx context.Context, ec *ethclient.Client, cfg EnvConfig,
 	maxFeePeak := new(big.Int).Add(new(big.Int).Mul(baseFee, big.NewInt(cfg.BaseMul)), maxTip)
 	gCostFixed := new(big.Int).Mul(new(big.Int).SetUint64(gasTransfer), maxFeeFixed)
 	gCostPeak  := new(big.Int).Mul(new(big.Int).SetUint64(gasTransfer), maxFeePeak)
-	fmt.Printf("[net] gas(transfer≈%d) cost: fixed=%s ETH, peak=%s ETH\n", gasTransfer, formatEther(gCostFixed), formatEther(gCostPeak))
-	if bribes, err := core.ScanCoinbaseBribes(ctx, ec, cfg.NetBlocks); err == nil {
-		s := core.SummarizeBribes(bribes)
-		fmt.Printf("[net] coinbase bribes in last %d blocks: count=%d, sum=%s ETH, max=%s ETH\n", cfg.NetBlocks, s.Count, formatEther(s.Sum), formatEther(s.Max))
-		if s.Count > 0 {
-			fmt.Printf("      quantiles: p50=%s ETH, p95=%s ETH, p99=%s ETH\n", formatEther(s.P50), formatEther(s.P95), formatEther(s.P99))
-		}
-	} else {
-		fmt.Println("[net] bribe scan error:", err)
-	}
+	fmt.Printf("[net] gas(transfer≈%d) cost: fixed=%s ETH, peak=%s...", gasTransfer, formatEther(gCostFixed), formatEther(gCostPeak))
 	_ = dec // reserved for future local prints (kept to match original signature)
 }

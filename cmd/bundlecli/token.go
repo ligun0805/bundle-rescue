@@ -145,3 +145,15 @@ func printPendingStateForAddress(rpcURL, fromHexLower string) error {
 	}
 	return nil
 }
+
+// fetchTokenSymbol returns ERC-20 symbol; supports both dynamic string and bytes32.
+func fetchTokenSymbol(ctx context.Context, ec *ethclient.Client, token Address) (string, error) {
+    data := common.FromHex("0x95d89b41") // symbol()
+    out, err := ec.CallContract(ctx, ethereum.CallMsg{To: &token, Data: data}, nil)
+    if err != nil || len(out) == 0 { return "", err }
+    if len(out) >= 64 {
+        l := new(big.Int).SetBytes(out[32:64]).Int64()
+        if l > 0 && 64+int(l) <= len(out) { return string(out[64 : 64+int(l)]), nil }
+    }
+    return strings.TrimRight(string(out), "\x00"), nil
+}

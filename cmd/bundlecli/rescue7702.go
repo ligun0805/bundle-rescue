@@ -22,37 +22,50 @@ import (
 func runRescue7702(ctx context.Context, ec *ethclient.Client, chainID *big.Int, cfg EnvConfig, safeAddr Address, compromisedPrivHex string, compromisedAddr Address) error {
 	reader := bufio.NewReader(os.Stdin)
 
-	// 1) Tokens list (CSV)
-	tokensCSV := readLine(reader, "Введите адреса токенов (через запятую), например USDT,USDC,... : ")
-	tokenAddrs, err := parseCSVAddresses(tokensCSV)
-	if err != nil || len(tokenAddrs) == 0 {
-		return fmt.Errorf("empty/invalid token list")
-	}
+    // 1) Tokens list (CSV) — use TOKEN_ADDRESS from .env if present
+    var tokenAddrs []common.Address
+    if strings.TrimSpace(cfg.TokenAddrHex) != "" {
+        if !common.IsHexAddress(cfg.TokenAddrHex) {
+            return fmt.Errorf("bad TOKEN_ADDRESS in .env")
+        }
+        tokenAddrs = []common.Address{ common.HexToAddress(cfg.TokenAddrHex) }
+    } else {
+        tokensCSV := readLine(reader, "Введите адреса токенов: ")
+        var err error
+        tokenAddrs, err = parseCSVAddresses(tokensCSV)
+        if err != nil || len(tokenAddrs) == 0 {
+            return fmt.Errorf("empty/invalid token list")
+        }
+    }
 	// Show balances (best-effort)
-	for _, t := range tokenAddrs {
-		dec, _ := fetchTokenDecimals(ctx, ec, t)
-		bal, _ := fetchTokenBalance(ctx, ec, t, compromisedAddr)
-		fmt.Println("  ", t.Hex(), "dec:", dec, "balance:", formatTokensFromWei(bal, dec))
+	if strings.TrimSpace(cfg.TokenAddrHex) == "" {
+		for _, t := range tokenAddrs {
+			dec, _ := fetchTokenDecimals(ctx, ec, t)
+			bal, _ := fetchTokenBalance(ctx, ec, t, compromisedAddr)
+			fmt.Println("  ", t.Hex(), "dec:", dec, "balance:", formatTokensFromWei(bal, dec))
+		}
 	}
 
-	// 2) Recipient (default SAFE)
-	toHex := readLine(reader, "Куда вывести токены? [ENTER = SAFE]: ")
+	// 2) Recipient (always SAFE when using env-driven flow; keep interactive only when TOKEN_ADDRESS not set)
 	recipient := safeAddr
-	if strings.TrimSpace(toHex) != "" {
-		if !common.IsHexAddress(toHex) { return fmt.Errorf("bad recipient") }
-		recipient = common.HexToAddress(toHex)
+	if strings.TrimSpace(cfg.TokenAddrHex) == "" {
+		// fallback interactive mode (legacy)
+		toHex := readLine(reader, "Куда вывести токены? [ENTER = SAFE]: ")
+		if strings.TrimSpace(toHex) != "" {
+			if !common.IsHexAddress(toHex) { return fmt.Errorf("bad recipient") }
+			recipient = common.HexToAddress(toHex)
+		}
 	}
 
-	// 3) Delegate (default from env)
-	defDelegate := strings.TrimSpace(cfg.DelegateHex)
-	dlgHex := readLine(reader, fmt.Sprintf("Адрес делегата (contract для 7702)? [ENTER = %s]: ", defDelegate))
-	if dlgHex == "" { dlgHex = defDelegate }
-	if !common.IsHexAddress(dlgHex) { return fmt.Errorf("bad delegate address") }
-	delegate := common.HexToAddress(dlgHex)
+	// 3) Delegate (always from env; do not ask)
+	if strings.TrimSpace(cfg.DelegateHex) == "" || !common.IsHexAddress(cfg.DelegateHex) {
+		return fmt.Errorf("bad DELEGATE_ADDRESS in .env")
+	}
+	delegate := common.HexToAddress(cfg.DelegateHex)
 	
     // 3.1) Token guard checks (single-token flow): bots/limits
     guardsOK, guardsWhy := true, ""
-    if len(tokenAddrs) == 1 {
+    if len(tokenAddrs) == 1 && strings.TrimSpace(cfg.TokenAddrHex) == "" {
         fmt.Println("  [*] Проверяю токен: blacklist/лимиты…")
         dec, _ := fetchTokenDecimals(ctx, ec, tokenAddrs[0])
         balVictim, _ := fetchTokenBalance(ctx, ec, tokenAddrs[0], compromisedAddr)
@@ -64,11 +77,27 @@ func runRescue7702(ctx context.Context, ec *ethclient.Client, chainID *big.Int, 
         } else {
             fmt.Println("  [+] Token guards OK.")
         }
+		
+        // 3.1.1) Global restrictions (paused/whitelist/blacklist) using bundlecore
+        if restr, err := core.CheckRestrictions(ctx, ec, tokenAddrs[0], compromisedAddr, recipient); err == nil {
+            fmt.Println("  [*] Token restrictions:", restr.Summary())
+            if restr.Blocked() {
+                guardsOK = false
+                if guardsWhy != "" {
+                    guardsWhy = guardsWhy + "; "
+                }
+                guardsWhy = guardsWhy + "restricted: " + restr.Summary()
+            }
+        } else {
+            fmt.Println("  [!] Token restrictions: error:", err)
+        }		
     }
+	
+	
 	
     // 3.2) Token preflight: single-token case — check contract code and simulate transfer via eth_call.
     preflightOK, preflightWhy := true, ""
-    if len(tokenAddrs) == 1 {
+    if len(tokenAddrs) == 1 && strings.TrimSpace(cfg.TokenAddrHex) == "" {
         fmt.Println("  [*] Предпроверка токена через eth_call…")
         if ok, why, err := preflightERC20Transfer(ctx, ec, tokenAddrs[0], compromisedAddr, recipient); err != nil {
             preflightOK, preflightWhy = false, fmt.Sprintf("token preflight error: %v", err)
@@ -80,7 +109,7 @@ func runRescue7702(ctx context.Context, ec *ethclient.Client, chainID *big.Int, 
     }
 
     // 3.2.1) Print checks summary and ask whether to continue if something failed
-    if len(tokenAddrs) == 1 {
+    if len(tokenAddrs) == 1 && strings.TrimSpace(cfg.TokenAddrHex) == "" {
         fmt.Println("  --- Результат проверок ---")
         if guardsOK {
             fmt.Println("   • Guards   : OK")
@@ -102,8 +131,8 @@ func runRescue7702(ctx context.Context, ec *ethclient.Client, chainID *big.Int, 
 	
 	
 	// 3.3) Route selection menu (wire classic modes here to avoid jumping back to another REPL)
-	fmt.Println("  --- Предпроверка завершена ---")
-	fmt.Println("  Доступные варианты вывода:")
+    fmt.Println("  --- Готово к выбору сценария ---")
+    fmt.Println("  Доступные варианты вывода:")
 	fmt.Println("   [1] Стандартный бандл")
 	fmt.Println("   [2] Бандл с feeHistory + coinbase bribe")
 	fmt.Println("   [3] EIP-7702 бандл (sponsored)")

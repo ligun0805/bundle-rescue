@@ -9,7 +9,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -127,7 +127,7 @@ func openViewPairsWindow(a fyne.App, rpc string) {
 						table.Refresh()
 					})
 					fyne.CurrentApp().SendNotification(&fyne.Notification{Title:"Edit", Content:"Row editor opened"})
-					viewWin.Canvas().Overlays().Show(container.NewPadded(form))
+					dialog.NewCustom("Edit Row", "Close", container.NewPadded(form), viewWin).Show()
 				}
 				delBtn.OnTapped = func() {
 					dialog := widget.NewPopUp(container.NewPadded(widget.NewLabel("Removing row…")), viewWin.Canvas())
