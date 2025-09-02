@@ -43,10 +43,25 @@ func runAll(a fyne.App, simOnly bool, rpc, chain, relays, auth, safe, blocksS, t
 			},
 		}
 		out, err := core.Run(ctx, ec, p)
-		if err != nil { appendLogLine(a, "error: "+err.Error()) } else {
+		if err != nil {
+			appendLogLine(a, "error: "+err.Error())
+			// mark FAILED
+			if i < len(pairs) { // defensive
+				// set status if present and refresh table
+				// (vars declared in main.go; safe to use here)
+				if i < len(pairStatus) { pairStatus[i] = "FAILED" }
+			}
+		} else {
 			appendLogLine(a, "result: " + out.Reason)
-			if out.Included { statsRescued++ }
+			if out.Included {
+				statsRescued++
+				if i < len(pairStatus) { pairStatus[i] = "COMPLETED" }
+			} else {
+				if i < len(pairStatus) { pairStatus[i] = "PENDING" }
+			}
 		}
+		// refresh grid, if it exists
+		if pairsTable != nil { pairsTable.Refresh() }
 		if logProg != nil { logProg.SetValue(float64(i+1)) }
 		if logProgLbl != nil { logProgLbl.SetText(fmt.Sprintf("%d/%d", i+1, total)) }
 	}

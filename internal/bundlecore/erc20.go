@@ -22,17 +22,31 @@ func EncodeERC20Transfer(to common.Address, amount *big.Int) []byte {
 	return append(selector, append(arg1, arg2...)...)
 }
 
-// Lightweight transfer preflight using EstimateGas / CallContract.
-func PreflightTransfer(ctx context.Context, ec *ethclient.Client, token, from, to common.Address, amount *big.Int) (ok bool, reason string, err error) {
-	data := EncodeERC20Transfer(to, amount)
-	msg := ethereum.CallMsg{From: from, To: &token, Data: data, Value: big.NewInt(0)}
-	if _, e := ec.EstimateGas(ctx, msg); e == nil {
-		return true, "", nil
-	}
-	if _, e := ec.CallContract(ctx, msg, nil); e != nil {
-		return false, revertReason(e), nil
-	}
-	return false, "transfer would revert", nil
+func PreflightTransfer(ctx context.Context, ec *ethclient.Client, token, from, to common.Address, amount *big.Int) (bool, string, error) {
+    // Build ERC-20 calldata: transfer(to, amount)
+    data := EncodeERC20Transfer(to, amount)
+    msg := ethereum.CallMsg{From: from, To: &token, Data: data, Value: big.NewInt(0)}
+
+    // 1) Do a static call to inspect return data (strict ERC-20 semantics).
+    ret, callErr := ec.CallContract(ctx, msg, nil)
+    if callErr != nil {
+        // Revert or other VM error: clearly not transferable.
+        return false, revertReason(callErr), nil
+    }
+
+    // 2) Interpret return:
+    //    - Some tokens return no data (pre-ERC20 behavior) => fall back to gas heuristic.
+    //    - Standard tokens return ABI-encoded bool in 32 bytes; treat last byte == 1 as true.
+    if len(ret) == 0 {
+        if _, e := ec.EstimateGas(ctx, msg); e == nil {
+            return true, "", nil
+        }
+        return false, "transfer would revert", nil
+    }
+    if ret[len(ret)-1] == 1 {
+        return true, "", nil
+    }
+    return false, "transfer() returned false", nil
 }
 
 func revertReason(e error) string {
