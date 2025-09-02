@@ -110,7 +110,7 @@ func atoi(s string, d int) int { var n int; _,err := fmt.Sscan(strings.TrimSpace
 func atoi64(s string, d int64) int64 { var n int64; _,err := fmt.Sscan(strings.TrimSpace(s), &n); if err!=nil { return d }; return n }
 func atof(s string, d float64) float64 { var n float64; _,err := fmt.Sscan(strings.TrimSpace(s), &n); if err!=nil { return d }; return n }
 func must(err error, msg string) { if err!=nil { die(msg+": "+err.Error()) } }
-func die(msg string) { fmt.Fprintln(os.Stderr, msg); os.Exit(1) }
+// NOTE: die(...) is defined in cli_io.go to show the error and wait for Enter before exiting.
 func mustBig(s string) *big.Int { z,newOk := new(big.Int), false; s=strings.TrimSpace(s); if strings.HasPrefix(s,"0x") { z,newOk = z.SetString(s[2:],16) } else { z,newOk = z.SetString(s,10) }; if !newOk { return big.NewInt(0) }; return z }
 func splitCSV(s string) []string { arr := strings.Split(s, ","); out := make([]string,0,len(arr)); for _,x := range arr { x=strings.TrimSpace(x); if x!="" { out=append(out,x) } }; return out }
 

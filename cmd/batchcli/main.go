@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"encoding/csv"
@@ -47,15 +48,15 @@ func mustLoadConfig() appConfig {
 
 	if cfg.inputPath == "" {
 		fmt.Fprintln(os.Stderr, "missing -input (or BATCH_INPUT) file with rows: token,privateKey")
-		os.Exit(2)
+		askExitAndQuit(2)
 	}
 	if cfg.rpcURL == "" {
 		fmt.Fprintln(os.Stderr, "missing RPC: set -rpc or RPC_URL")
-		os.Exit(2)
+		askExitAndQuit(2)
 	}
 	if strings.TrimSpace(cfg.safePrivateHex) == "" {
 		fmt.Fprintln(os.Stderr, "missing SAFE private key: set -safe-pk or SAFE_PRIVATE_KEY")
-		os.Exit(2)
+		askExitAndQuit(2)
 	}
 	return cfg
 }
@@ -75,9 +76,17 @@ func main() {
 	cfg := mustLoadConfig()
 	if err := run(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
-		os.Exit(1)
+		askExitAndQuit(1)
 	}
 	fmt.Println("Done. OK =>", cfg.outOKPath, " BAD =>", cfg.outBadPath)
+}
+
+// askExitAndQuit prints a prompt and waits for Enter before exiting.
+// This avoids instant window close on double-click runs (Windows).
+func askExitAndQuit(code int) {
+	fmt.Fprint(os.Stderr, "Exit now? Press Enter to close...")
+	_, _ = bufio.NewReader(os.Stdin).ReadBytes('\n')
+	os.Exit(code)
 }
 
 func run(cfg appConfig) error {

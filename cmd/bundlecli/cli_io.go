@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"os"
 	"strings"
 	"syscall"
 
@@ -19,7 +20,7 @@ func readPassword(prompt string) string {
 	fmt.Print(prompt)
 	b, err := term.ReadPassword(int(syscall.Stdin))
 	fmt.Println()
-	if err != nil { die("failed to read password: "+err.Error()) }
+	if err != nil { die("failed to read password: " + err.Error()) }
 	return strings.TrimSpace(string(b))
 }
 
@@ -44,4 +45,13 @@ func AskStrategy(r *bufio.Reader) string {
     fmt.Print("Ваш выбор [1/2/3]: ")
     s, _ := r.ReadString('\n')
     return strings.TrimSpace(s)
+}
+
+// die prints an error and waits for Enter before exiting.
+// This prevents instant console close on Windows double-click runs.
+func die(message string) {
+	fmt.Fprintln(os.Stderr, "Error:", message)
+	fmt.Fprint(os.Stderr, "Exit now? Press Enter to close...")
+	_, _ = bufio.NewReader(os.Stdin).ReadBytes('\n')
+	os.Exit(1)
 }
