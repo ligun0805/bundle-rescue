@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/big"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +29,7 @@ type appConfig struct {
 	inputPath      string
 	outOKPath      string
 	outBadPath     string
+	rpcDelay       time.Duration
 }
 
 func getenv(key, def string) string {
@@ -44,6 +46,13 @@ func mustLoadConfig() appConfig {
 	flag.StringVar(&cfg.outBadPath, "out-bad", getenv("BATCH_OUT_BAD", "bad_pairs.csv"), "Output CSV for rejected pairs")
 	flag.StringVar(&cfg.rpcURL, "rpc", getenv("RPC_URL", ""), "RPC endpoint URL")
 	flag.StringVar(&cfg.safePrivateHex, "safe-pk", getenv("SAFE_PRIVATE_KEY", ""), "SAFE private key (hex) to receive tokens")
+	// Throttle between RPC calls (helps avoid 429 / -32005). Default: 200 ms.
+	delayEnv := getenv("BATCH_RPC_DELAY_MS", "200")
+	delayMS := 200
+	if v, err := strconv.Atoi(strings.TrimSpace(delayEnv)); err == nil && v >= 0 {
+		delayMS = v
+	}
+	flag.IntVar(&delayMS, "rpc-delay-ms", delayMS, "Delay between RPC calls in milliseconds")
 	flag.Parse()
 
 	if cfg.inputPath == "" {
@@ -58,6 +67,7 @@ func mustLoadConfig() appConfig {
 		fmt.Fprintln(os.Stderr, "missing SAFE private key: set -safe-pk or SAFE_PRIVATE_KEY")
 		askExitAndQuit(2)
 	}
+	cfg.rpcDelay = time.Duration(delayMS) * time.Millisecond
 	return cfg
 }
 
@@ -74,6 +84,7 @@ type pairRow struct {
 
 func main() {
 	cfg := mustLoadConfig()
+	setRPCDelay(cfg.rpcDelay)
 	if err := run(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		askExitAndQuit(1)
@@ -225,27 +236,32 @@ func processOne(ec *ethclient.Client, safeAddr common.Address, tokenHex, private
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
+	// decimals(): on failure assume 18 (do not reject)
 	dec, derr := fetchTokenDecimals(ctx, ec, out.tokenAddress)
 	if derr != nil {
-		out.reason = "decimals() call failed"
-		return out
+		out.tokenDecimals = 18
+	} else {
+		out.tokenDecimals = dec
 	}
-	out.tokenDecimals = dec
-	if sym, e := fetchTokenSymbol(ctx, ec, out.tokenAddress); e == nil {
+	// symbol(): best-effort
+	if sym, e := fetchTokenSymbol(ctx, ec, out.tokenAddress); e == nil && sym != "" {
 		out.tokenSymbol = sym
 	}
 
+	// balanceOf(): if failed — fallback to preflight(1)
 	bal, berr := fetchTokenBalance(ctx, ec, out.tokenAddress, out.fromAddress)
-	if berr != nil {
-		out.reason = "balanceOf() call failed"
-		return out
-	}
 	out.balanceWei = bal
-	if bal == nil || bal.Sign() <= 0 {
-		out.reason = "zero token balance"
+	// If balance call failed or zero — still check if path is transferable with tiny amount.
+	if berr != nil || bal == nil || bal.Sign() <= 0 {
+		if reason := checkTransferViability(ctx, ec, out.tokenAddress, out.fromAddress, safeAddr, big.NewInt(1)); reason != "" {
+			out.reason = "not transferable: " + reason
+			return out
+		}
+		// transferable but no balance now — mark as OK (balance shown as 0)
 		return out
 	}
 
+	// Non-zero balance: regular strict preflight
 	if reason := checkTransferViability(ctx, ec, out.tokenAddress, out.fromAddress, safeAddr, bal); reason != "" {
 		out.reason = reason
 		return out
@@ -280,7 +296,8 @@ func hexToECDSA(s string) (*ecdsa.PrivateKey, error) {
 
 func fetchTokenDecimals(ctx context.Context, ec *ethclient.Client, token common.Address) (int, error) {
 	data := common.FromHex("0x313ce567") // decimals()
-	res, err := ec.CallContract(ctx, ethereum.CallMsg{To: &token, Data: data}, nil)
+	throttle()
+	res, err := callContractWithRetry(ctx, ec, ethereum.CallMsg{To: &token, Data: data})
 	if err != nil {
 		return 0, err
 	}
@@ -296,7 +313,8 @@ func fetchTokenDecimals(ctx context.Context, ec *ethclient.Client, token common.
 
 func fetchTokenBalance(ctx context.Context, ec *ethclient.Client, token, owner common.Address) (*big.Int, error) {
 	data := append(common.FromHex("0x70a08231"), common.LeftPadBytes(owner.Bytes(), 32)...)
-	res, err := ec.CallContract(ctx, ethereum.CallMsg{To: &token, Data: data}, nil)
+	throttle()
+	res, err := callContractWithRetry(ctx, ec, ethereum.CallMsg{To: &token, Data: data})
 	if err != nil {
 		return nil, err
 	}
@@ -308,7 +326,8 @@ func fetchTokenBalance(ctx context.Context, ec *ethclient.Client, token, owner c
 
 func fetchTokenSymbol(ctx context.Context, ec *ethclient.Client, token common.Address) (string, error) {
 	data := common.FromHex("0x95d89b41") // symbol()
-	out, err := ec.CallContract(ctx, ethereum.CallMsg{To: &token, Data: data}, nil)
+	throttle()
+	out, err := callContractWithRetry(ctx, ec, ethereum.CallMsg{To: &token, Data: data})
 	if err != nil || len(out) == 0 {
 		return "", err
 	}
@@ -321,6 +340,39 @@ func fetchTokenSymbol(ctx context.Context, ec *ethclient.Client, token common.Ad
 	}
 	// Fallback: bytes32 right-padded with zeros
 	return strings.TrimRight(string(out), "\x00"), nil
+}
+
+// --- tiny RPC throttle/retry (batch-local) ---
+var gRPCDelay time.Duration
+
+func setRPCDelay(d time.Duration) { gRPCDelay = d }
+
+// throttle sleeps between RPC calls to avoid rate limiting.
+func throttle() {
+	if gRPCDelay > 0 {
+		time.Sleep(gRPCDelay)
+	}
+}
+
+// callContractWithRetry wraps eth_call with small exponential backoff.
+func callContractWithRetry(ctx context.Context, ec *ethclient.Client, msg ethereum.CallMsg) ([]byte, error) {
+	const maxAttempts = 3
+	backoff := 200 * time.Millisecond
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		ret, err := ec.CallContract(ctx, msg, nil)
+		if err == nil {
+			return ret, nil
+		}
+		lastErr = err
+		if attempt < maxAttempts {
+			time.Sleep(backoff)
+			if strings.Contains(err.Error(), "Too Many Requests") || strings.Contains(err.Error(), "-32005") {
+				backoff *= 2
+			}
+		}
+	}
+	return nil, lastErr
 }
 
 func formatTokensFromWei(x *big.Int, decimals int) string {

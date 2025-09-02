@@ -7,6 +7,7 @@ import (
 
 	"context"
 	"math/big"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
@@ -22,31 +23,81 @@ func EncodeERC20Transfer(to common.Address, amount *big.Int) []byte {
 	return append(selector, append(arg1, arg2...)...)
 }
 
+// --- small RPC helpers (retry + backoff) ---
+func isRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "Too Many Requests") || strings.Contains(s, "-32005")
+}
+
+// callWithRetry performs eth_call with small exponential backoff.
+func callWithRetry(ctx context.Context, ec *ethclient.Client, msg ethereum.CallMsg) ([]byte, error) {
+	const maxAttempts = 3
+	backoff := 200 * time.Millisecond
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		ret, err := ec.CallContract(ctx, msg, nil)
+		if err == nil {
+			return ret, nil
+		}
+		lastErr = err
+		if attempt < maxAttempts {
+			time.Sleep(backoff)
+			if isRateLimitError(err) {
+				backoff *= 2
+			}
+		}
+	}
+	return nil, lastErr
+}
+
+func estimateGasWithRetry(ctx context.Context, ec *ethclient.Client, msg ethereum.CallMsg) (uint64, error) {
+	const maxAttempts = 3
+	backoff := 200 * time.Millisecond
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		g, err := ec.EstimateGas(ctx, msg)
+		if err == nil {
+			return g, nil
+		}
+		lastErr = err
+		if attempt < maxAttempts {
+			time.Sleep(backoff)
+			if isRateLimitError(err) {
+				backoff *= 2
+			}
+		}
+	}
+	return 0, lastErr
+}
+
 func PreflightTransfer(ctx context.Context, ec *ethclient.Client, token, from, to common.Address, amount *big.Int) (bool, string, error) {
-    // Build ERC-20 calldata: transfer(to, amount)
-    data := EncodeERC20Transfer(to, amount)
-    msg := ethereum.CallMsg{From: from, To: &token, Data: data, Value: big.NewInt(0)}
+	// Build ERC-20 calldata: transfer(to, amount)
+	data := EncodeERC20Transfer(to, amount)
+	msg := ethereum.CallMsg{From: from, To: &token, Data: data, Value: big.NewInt(0)}
 
-    // 1) Do a static call to inspect return data (strict ERC-20 semantics).
-    ret, callErr := ec.CallContract(ctx, msg, nil)
-    if callErr != nil {
-        // Revert or other VM error: clearly not transferable.
-        return false, revertReason(callErr), nil
-    }
+	// 1) Static call with retry to inspect return data (strict ERC-20 semantics).
+	ret, callErr := callWithRetry(ctx, ec, msg)
+	if callErr != nil {
+		// Revert or other VM error: clearly not transferable.
+		return false, revertReason(callErr), nil
+	}
 
-    // 2) Interpret return:
-    //    - Some tokens return no data (pre-ERC20 behavior) => fall back to gas heuristic.
-    //    - Standard tokens return ABI-encoded bool in 32 bytes; treat last byte == 1 as true.
-    if len(ret) == 0 {
-        if _, e := ec.EstimateGas(ctx, msg); e == nil {
-            return true, "", nil
-        }
-        return false, "transfer would revert", nil
-    }
-    if ret[len(ret)-1] == 1 {
-        return true, "", nil
-    }
-    return false, "transfer() returned false", nil
+	// 2) Interpret return:
+	//    - Some tokens return no data (pre-ERC20 behavior) => fall back to gas heuristic.
+	//    - Standard tokens return ABI-encoded bool in 32 bytes; treat last byte == 1 as true.
+	if len(ret) == 0 {
+		if _, e := estimateGasWithRetry(ctx, ec, msg); e == nil {
+			return true, "", nil
+		}
+		return false, "transfer would revert", nil
+	}
+	if ret[len(ret)-1] == 1 {
+		return true, "", nil
+	}
+	return false, "transfer() returned false", nil
 }
 
 func revertReason(e error) string {
