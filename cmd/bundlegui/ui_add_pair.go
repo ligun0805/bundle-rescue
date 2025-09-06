@@ -77,7 +77,7 @@ func openAddPairWindow(a fyne.App, rpc string, safePk string) {
 		if token == "" || !common.IsHexAddress(token) { status.SetText("Token address invalid"); spinner.Hide(); return }
 		if !common.IsHexAddress(from) { status.SetText("From address invalid"); spinner.Hide(); return }
 		if !common.IsHexAddress(to)   { status.SetText("To address invalid"); spinner.Hide(); return }
-		ec, err := ethclient.Dial(rpc); if err != nil { status.SetText("RPC dial: "+err.Error()); spinner.Hide(); return }
+		ec, err := newEthClientWithTimeout(rpc); if err != nil { status.SetText("RPC dial: "+err.Error()); spinner.Hide(); return }
 		dec := atoi(decE.Text, -1)
 		if dec < 0 {
 			if d, e := fetchTokenDecimals(ec, common.HexToAddress(token)); e == nil { dec = d; decE.SetText(fmt.Sprintf("%d", d)) } else { status.SetText("decimals: "+e.Error()); spinner.Hide(); return }

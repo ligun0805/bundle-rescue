@@ -20,7 +20,7 @@ func runAll(a fyne.App, simOnly bool, rpc, chain, relays, auth, safe, blocksS, t
 		}
 	}()
 	if len(pairs)==0 { appendLogLine(a, "no pairs"); return }
-	ec, err := ethclient.Dial(rpc); if err!=nil { appendLogLine(a, fmt.Sprintf("dial err: %v", err)); return }
+	ec, err := newEthClientWithTimeout(rpc); if err!=nil { appendLogLine(a, fmt.Sprintf("dial err: %v", err)); return }
 	runCtx, runCancel = context.WithCancel(context.Background())
 	ctx := runCtx
 	total := len(pairs)

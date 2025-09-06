@@ -125,7 +125,7 @@ var pausedSigs = [][]byte{
 
 func CheckPaused(ctx context.Context, ec *ethclient.Client, token common.Address) (known, paused bool, err error) {
 	for _, sig := range pausedSigs {
-		res, e := ec.CallContract(ctx, ethereum.CallMsg{To: &token, Data: sig}, nil)
+		res, e := callWithRetry(ctx, ec, ethereum.CallMsg{To: &token, Data: sig})
 		if e != nil || len(res) == 0 {
 			continue
 		}
@@ -233,7 +233,7 @@ func CheckRestrictions(ctx context.Context, ec *ethclient.Client, token common.A
 	}
 
 	call := func(data []byte) (ret []byte, ok bool) {
-		res, err := ec.CallContract(ctx, ethereum.CallMsg{To: &token, Data: data}, nil)
+		res, err := callWithRetry(ctx, ec, ethereum.CallMsg{To: &token, Data: data})
 		if err != nil || len(res) == 0 {
 			return nil, false
 		}
@@ -291,5 +291,5 @@ func CheckRestrictions(ctx context.Context, ec *ethclient.Client, token common.A
 
 func EstimateTransferGas(ctx context.Context, ec *ethclient.Client, from common.Address, token common.Address, data []byte) (uint64, error) {
 	msg := ethereum.CallMsg{From: from, To: &token, Value: big.NewInt(0), Data: data}
-	return ec.EstimateGas(ctx, msg)
+	return estimateGasWithRetry(ctx, ec, msg)
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"image/color"
 	"math/big"
+  "net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/crypto"
+  "github.com/ethereum/go-ethereum/rpc"
 	ethereum "github.com/ethereum/go-ethereum"
 	"github.com/joho/godotenv"
 	core "github.com/ligun0805/bundle-rescue/internal/bundlecore"
@@ -27,6 +29,15 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
+
+// newEthClientWithTimeout dials RPC with keep-alives and sane timeouts.
+func newEthClientWithTimeout(rpcURL string) (*ethclient.Client, error) {
+	transport := &http.Transport{ MaxIdleConns: 100, IdleConnTimeout: 90 * time.Second, DisableCompression: false }
+	httpClient := &http.Client{ Timeout: 30 * time.Second, Transport: transport }
+	rpcClient, err := rpc.DialHTTPWithClient(rpcURL, httpClient)
+	if err != nil { return nil, err }
+	return ethclient.NewClient(rpcClient), nil
+}
 
 // --- UI globals used across files (ui_run.go needs them) ---
 var (
@@ -363,7 +374,7 @@ func main() {
 			var ps []pairRow
 			if ext==".txt" || ext=="" {
 				// Each line: "<fromPrivKey> <tokenAddress>"
-				ec, e := ethclient.Dial(rpcEntry.Text); if e!=nil { dialog.ShowInformation("Import", "RPC dial error: "+e.Error(), w); return }
+				ec, e := newEthClientWithTimeout(rpcEntry.Text); if e!=nil { dialog.ShowInformation("Import", "RPC dial error: "+e.Error(), w); return }
 				for scanner := bufio.NewScanner(rc); scanner.Scan(); {
 					line := strings.TrimSpace(scanner.Text()); if line=="" || strings.HasPrefix(line,"#") { continue }
 					parts := strings.Fields(line); if len(parts) < 2 { continue }
@@ -403,7 +414,7 @@ func main() {
 			pairsTable.Refresh() // refresh list
 
 			// --- Проверки по парам с прогресс-баром и ретраями ---
-			ec, err := ethclient.Dial(rpcEntry.Text)
+			ec, err := newEthClientWithTimeout(rpcEntry.Text)
 			if err != nil { dialog.ShowError(fmt.Errorf("RPC dial failed: %w", err), w); return }
 			total := float64(len(pairs)-start)
 			prog := dialog.NewProgress("Import checks", "Running token checks…", w)

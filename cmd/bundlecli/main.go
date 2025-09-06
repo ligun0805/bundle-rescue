@@ -2,26 +2,46 @@ package main
 
 import (
 	"context"
+  "flag"
 	"fmt"
 	"math/big"
+  "net/http"
 	"strings"
+  "os"
+  "time"
 
 	"github.com/joho/godotenv"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/common"
+  "github.com/ethereum/go-ethereum/rpc"
 	core "github.com/ligun0805/bundle-rescue/internal/bundlecore"
 )
 
+// newEthClientWithTimeout dials RPC with keep-alives and sane timeouts.
+func newEthClientWithTimeout(rpcURL string) (*ethclient.Client, error) {
+	transport := &http.Transport{ MaxIdleConns: 100, IdleConnTimeout: 90 * time.Second, DisableCompression: false }
+	httpClient := &http.Client{ Timeout: 30 * time.Second, Transport: transport }
+	rpcClient, err := rpc.DialHTTPWithClient(rpcURL, httpClient)
+	if err != nil { return nil, err }
+	return ethclient.NewClient(rpcClient), nil
+}
+
 // main keeps high-level flow; details are extracted to small helpers (see *.go in this folder).
 func main() {
-	_ = godotenv.Load()
+	var pairsPath string
+	flag.StringVar(&pairsPath, "pairs", "", "Path to CSV for batch EIP-7702 mode (token,privateKey,from[,reason])")
+	flag.Parse()	
+  
+  _ = godotenv.Load()
 	_ = godotenv.Overload(".env.local")
 
 	ctx := context.Background()
 	cfg := loadEnv()
 
-	ec, err := ethclient.Dial(cfg.RPC)
+	ec, err := newEthClientWithTimeout(cfg.RPC)
 	must(err, "dial RPC")
+	// Best-effort RPC client for eth_call stateOverrides (7702 preflight)
+	rc, _ := rpc.DialContext(ctx, cfg.RPC)
 
 	var chainID *big.Int
 	if strings.TrimSpace(cfg.ChainIDStr) != "" {
@@ -33,6 +53,19 @@ func main() {
 	if strings.TrimSpace(cfg.SafePK) == "" { die("SAFE_PRIVATE_KEY is empty in env") }
 	safeAddr := mustAddrFromPK(cfg.SafePK)
     safeBal, _ := ec.BalanceAt(ctx, safeAddr, nil)
+
+    // --- Batch mode (EIP-7702 only) BEFORE reading FROM_PK ---
+    // Priority: --pairs flag > PAIRS_CSV env > interactive.
+    batchPath := strings.TrimSpace(pairsPath)
+    if batchPath == "" {
+        batchPath = strings.TrimSpace(os.Getenv("PAIRS_CSV"))
+    }
+    if batchPath != "" {
+        if err := runBatchPairsFromCSV(ctx, ec, cfg, chainID, safeAddr, batchPath); err != nil {
+            fmt.Println("  [batch] error:", err)
+        }
+        return
+    }
 
     // Resolve FROM/TOKEN from env (optional token)
     fromAddr := mustAddrFromPK(cfg.FromPK)
@@ -89,17 +122,33 @@ func main() {
 		} else {
 			fmt.Println("  [!] Token restrictions: error:", err)
 		}
-		// Preflight via eth_call
-		if ok, why, err := preflightERC20Transfer(ctx, ec, tokenAddr, fromAddr, safeAddr); err != nil {
+		// Preflight via core.PreflightTransfer (has retry/backoff against 429/-32005)
+		// Use victim balance if known, otherwise test with 1 wei to detect pure-revert/false.
+		preflightAmt := victimBal
+		if preflightAmt == nil || preflightAmt.Sign() <= 0 {
+			preflightAmt = big.NewInt(1)
+		}
+		if ok, why, err := core.PreflightTransfer(ctx, ec, tokenAddr, fromAddr, safeAddr, preflightAmt); err != nil {
 			preOK, preWhy = false, fmt.Sprintf("preflight error: %v", err)
 		} else if !ok {
 			preOK, preWhy = false, why
 		} else {
-			if strings.TrimSpace(why) != "" {
-				fmt.Println("  [+] Token preflight OK —", why)
-			} else {
-				fmt.Println("  [+] Token preflight OK.")
+			// legacy preflight OK
+			line := "  [+] Token preflight OK"
+			if strings.TrimSpace(why) != "" { line += " — " + why }
+			// add 7702-aware hint (route selection) without removing legacy result
+			if rc != nil {
+				if ok2, why2, err2 := core.PreflightTransfer7702(ctx, ec, rc, tokenAddr, fromAddr, safeAddr, preflightAmt); err2 == nil {
+					if strings.TrimSpace(why2) != "" {
+						line += " | 7702: " + why2
+					} else if ok2 {
+						line += " | 7702: ok"
+					}
+				} else if err2 != nil {
+					line += " | 7702: error: " + err2.Error()
+				}
 			}
+			fmt.Println(line)
 		}
 		// Summary
 		fmt.Println("  --- Результат проверок ---")
@@ -110,7 +159,9 @@ func main() {
     }
     fmt.Println()
     fmt.Println("Результаты проверок....")
-	runInteractiveLoop(ctx, ec, chainID, cfg, safeAddr)
+
+
+  runInteractiveLoop(ctx, ec, chainID, cfg, safeAddr)
 	_ = core.Result{} // keep import pinned
 }
 

@@ -3,17 +3,23 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/ecdsa"
+	"encoding/csv"
 	"fmt"
 	"math/big"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/rpc"
 	eip7702 "github.com/ligun0805/bundle-rescue/internal/eip7702"
 	core "github.com/ligun0805/bundle-rescue/internal/bundlecore"
 )
@@ -130,42 +136,20 @@ func runRescue7702(ctx context.Context, ec *ethclient.Client, chainID *big.Int, 
     }
 	
 	
-	// 3.3) Route selection menu (wire classic modes here to avoid jumping back to another REPL)
-    fmt.Println("  --- Готово к выбору сценария ---")
-    fmt.Println("  Доступные варианты вывода:")
-	fmt.Println("   [1] Стандартный бандл")
-	fmt.Println("   [2] Бандл с feeHistory + coinbase bribe")
-	fmt.Println("   [3] EIP-7702 бандл (sponsored)")
-	route := readLine(reader, "Выберите режим [1/2/3, ENTER=3]: ")
-	route = strings.TrimSpace(route)
-	if route == "" { route = "3" }
-	switch route {
-	case "3":
-		// EIP-7702: require non-zero token balance on FROM, else fail explicitly
-		allZero := true
-		for _, t := range tokenAddrs {
-			if bal, err := fetchTokenBalance(ctx, ec, t, compromisedAddr); err == nil && bal != nil && bal.Sign() > 0 {
-				allZero = false
-				break
-			}
+	// 3.3) Route is forced to EIP-7702; no menu.
+	// Require non-zero token balance on FROM, else fail explicitly.
+	allZero := true
+	for _, t := range tokenAddrs {
+		if bal, err := fetchTokenBalance(ctx, ec, t, compromisedAddr); err == nil && bal != nil && bal.Sign() > 0 {
+			allZero = false
+			break
 		}
-		if allZero {
-			return fmt.Errorf("token balance is zero")
-		}
-		// continue with EIP-7702 flow below
-	case "1", "2":
-		// Execute classic bundle inline (no code duplication, reuse core.Params like in params_build.go)
-		if len(tokenAddrs) != 1 {
-			return fmt.Errorf("для классического режима ожидается один токен")
-		}
-		if err := runClassicBundleFromRescueMenu(ctx, ec, chainID, cfg, compromisedPrivHex, compromisedAddr, tokenAddrs[0], recipient, route); err != nil {
-			return err
-		}
-		return nil
-	default:
-		return fmt.Errorf("неизвестный режим: %s", route)
 	}
-		
+	if allZero {
+		return fmt.Errorf("token balance is zero")
+	}
+	// continue with EIP-7702 flow below
+	
 
 
 	// 4) Auth nonce and count
@@ -234,6 +218,292 @@ func runRescue7702(ctx context.Context, ec *ethclient.Client, chainID *big.Int, 
 		}
 	}
 	return nil
+}
+
+// --------------------
+// Batch CSV processing (moved here to avoid creating a new file)
+// --------------------
+
+// runBatchPairsFromCSV runs non-interactive EIP-7702 rescue for each CSV row.
+// CSV format: token,privateKey,from[,reason]
+func runBatchPairsFromCSV(
+	ctx context.Context,
+	ec *ethclient.Client,
+	cfg EnvConfig,
+	chainID *big.Int,
+	sponsorAddr common.Address,
+	csvPath string,
+) error {
+	csvPath = strings.TrimSpace(csvPath)
+	if csvPath == "" {
+		return fmt.Errorf("empty CSV path")
+	}
+	f, err := os.Open(csvPath)
+	if err != nil {
+		return fmt.Errorf("open CSV: %w", err)
+	}
+	defer f.Close()
+
+	r := csv.NewReader(bufio.NewReader(f))
+	r.FieldsPerRecord = -1
+	rows, err := r.ReadAll()
+	if err != nil {
+		return fmt.Errorf("parse CSV: %w", err)
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("CSV is empty")
+	}
+
+	// Logging
+	_ = os.MkdirAll("logs", 0o755)
+	logPath := filepath.Join("logs", fmt.Sprintf("bundlecli_batch_%s.log", time.Now().Format("20060102_150405")))
+	lf, err := os.Create(logPath)
+	if err != nil {
+		return fmt.Errorf("create log: %w", err)
+	}
+	defer lf.Close()
+	logw := bufio.NewWriter(lf)
+	defer logw.Flush()
+	fmt.Fprintf(logw, "# batch started at %s\n", time.Now().Format(time.RFC3339))
+
+	// RPC for 7702 preflight
+	httpClient := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{MaxIdleConns: 100, IdleConnTimeout: 90 * time.Second}}
+	rc, err := rpc.DialHTTPWithClient(cfg.RPC, httpClient)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	// Minimal ABI for delegate calls
+	const delegateABI = `[
+	  {"type":"function","stateMutability":"nonpayable","name":"sweepToken",
+	   "inputs":[{"name":"token","type":"address"},{"name":"recipient","type":"address"}],"outputs":[]},
+	  {"type":"function","stateMutability":"nonpayable","name":"sellToETH_V2",
+	   "inputs":[
+	     {"name":"tokenIn","type":"address"},
+	     {"name":"amountIn","type":"uint256"},
+	     {"name":"amountOutMinETH","type":"uint256"},
+	     {"name":"recipient","type":"address"},
+	     {"name":"deadline","type":"uint256"}
+	   ],"outputs":[]}
+	]`
+	parsedABI, err := abi.JSON(strings.NewReader(delegateABI))
+	if err != nil {
+		return fmt.Errorf("delegate ABI parse: %w", err)
+	}
+	if strings.TrimSpace(cfg.DelegateHex) == "" || !common.IsHexAddress(cfg.DelegateHex) {
+		return fmt.Errorf("bad DELEGATE_ADDRESS in .env")
+	}
+	delegateAddr := common.HexToAddress(cfg.DelegateHex)
+	relays := splitCSV(cfg.RelaysCSV)
+
+	// Skip header if present
+	start := 0
+	if len(rows) > 0 {
+		h := strings.ToLower(strings.TrimSpace(rows[0][0]))
+		if strings.Contains(h, "token") || strings.Contains(h, "address") {
+			start = 1
+		}
+	}
+
+	// Keep a local sponsor nonce counter for private relays.
+	// Private relays do not advance pending nonce in your public RPC.
+	nextNonce, err := eip7702.EstimateSponsorNonce(ctx, ec, sponsorAddr) // uint64
+	if err != nil {
+		return fmt.Errorf("sponsor nonce error: %w", err)
+	}
+
+
+	for i := start; i < len(rows); i++ {
+		row := rows[i]
+		if len(row) < 3 {
+			continue
+		}
+		tokenHex := strings.TrimSpace(row[0])
+		fromPKHex := strings.TrimSpace(row[1])
+		fromHex := strings.TrimSpace(row[2])
+
+		if !common.IsHexAddress(tokenHex) || !common.IsHexAddress(fromHex) || len(fromPKHex) < 16 {
+			fmt.Fprintf(logw, "[row %d] skip: malformed values\n", i+1)
+			continue
+		}
+		token := common.HexToAddress(tokenHex)
+		from := common.HexToAddress(fromHex)
+
+		// PK -> from check
+		fromPK, err := crypto.HexToECDSA(strings.TrimPrefix(fromPKHex, "0x"))
+		if err != nil || crypto.PubkeyToAddress(fromPK.PublicKey) != from {
+			fmt.Fprintf(logw, "[row %d] error: bad private key for %s\n", i+1, from.Hex())
+			continue
+		}
+
+		// Balance
+		bal, err := fetchTokenBalance(ctx, ec, token, from)
+		if err != nil {
+			fmt.Fprintf(logw, "[row %d] %s balanceOf error: %v\n", i+1, token.Hex(), err)
+			continue
+		}
+		if bal == nil || bal.Sign() == 0 {
+			fmt.Fprintf(logw, "[row %d] %s balance=0 - skip\n", i+1, token.Hex())
+			continue
+		}
+
+    // Decide route by 7702 preflight (with optional force-swap)
+    ok, why, _ := core.PreflightTransfer7702(ctx, ec, rc, token, from, sponsorAddr, bal)
+    route := "sell-v2" // default: swap to ETH, send ETH to SAFE
+    // Force swap if:
+    //  • SWAP_ONLY=1 in environment, OR
+    //  • CSV has 4th column containing word "swap" for this row.
+    preferSwap := strings.EqualFold(strings.TrimSpace(os.Getenv("SWAP_ONLY")), "1")
+    if !preferSwap && len(row) >= 4 && strings.Contains(strings.ToLower(row[3]), "swap") {
+        preferSwap = true
+    }
+    if !preferSwap && ok { route = "transfer" }
+		fmt.Fprintf(logw, "[row %d] plan: %s (%s)\n", i+1, route, why)
+
+		// Additional preflight: when plan is sell-v2, ensure swap path [token->WETH] has liquidity.
+		if route == "sell-v2" {
+			if okSwap, reason := preflightSellV2GetAmountsOut(ctx, ec, token, bal); !okSwap {
+				fmt.Fprintf(logw, "[row %d] sell-v2 preflight FAIL: %s - skip\n", i+1, reason)
+				continue
+			}
+		}
+
+		// Calldata
+		var calldata []byte
+		switch route {
+		case "transfer":
+			calldata, err = parsedABI.Pack("sweepToken", token, sponsorAddr)
+		default:
+			amountOutMin := big.NewInt(0)
+			deadline := big.NewInt(time.Now().Add(20 * time.Minute).Unix())
+			calldata, err = parsedABI.Pack("sellToETH_V2", token, bal, amountOutMin, sponsorAddr, deadline)
+		}
+		if err != nil {
+			fmt.Fprintf(logw, "[row %d] abi pack failed: %v\n", i+1, err)
+			continue
+		}
+
+		// 7702 authorizations
+		authNonce, _ := ec.NonceAt(ctx, from, nil)
+		auths, err := eip7702.BuildAuthorizations(chainID, from, delegateAddr, authNonce, 1, fromPK)
+		if err != nil {
+			fmt.Fprintf(logw, "[row %d] build auth failed: %v\n", i+1, err)
+			continue
+		}
+
+		var tipWei *big.Int
+		if cfg.TipGwei > 0 {
+			tipWei = new(big.Int).Mul(big.NewInt(cfg.TipGwei), big.NewInt(1_000_000_000))
+		}
+		tip, cap, err := eip7702.PrepareFees(ctx, ec, tipWei)
+		if err != nil {
+			fmt.Fprintf(logw, "[row %d] fee prep error: %v\n", i+1, err)
+			continue
+		}
+		// ASCII-only comment
+		gasLimit := uint64(500_000) // transfer~90k, v2~220-300k => 500k headroom
+
+		// Build & sign
+		unsigned, err := eip7702.BuildSetCodeTx(eip7702.BuildParams{
+			ChainID:           chainID,
+			SponsorNonce:      nextNonce,
+			GasLimit:          gasLimit,
+			MaxPriorityFeeWei: tip,
+			MaxFeeWei:         cap,
+			AuthorityEOA:      from,
+			DelegateContract:  delegateAddr,
+			Calldata:          calldata,
+			Authorizations:    auths,
+		})
+		if err != nil {
+			fmt.Fprintf(logw, "[row %d] build setcode tx failed: %v\n", i+1, err)
+			continue
+		}
+    nextNonce++  // uint64 increment
+		safePK, err := crypto.HexToECDSA(strings.TrimPrefix(cfg.SafePK, "0x"))
+		if err != nil {
+			fmt.Fprintf(logw, "[row %d] safe key parse failed: %v\n", i+1, err)
+			continue
+		}
+		signed, err := eip7702.SignSetCodeTx(chainID, safePK, unsigned)
+		if err != nil {
+			fmt.Fprintf(logw, "[row %d] sign failed: %v\n", i+1, err)
+			continue
+		}
+
+		// Send private
+		raw, err := signed.MarshalBinary()
+		if err != nil {
+			fmt.Fprintf(logw, "[row %d] rlp failed: %v\n", i+1, err)
+			continue
+		}
+		var authSigner *ecdsa.PrivateKey
+		if strings.TrimSpace(cfg.AuthPK) != "" {
+			if k, e := crypto.HexToECDSA(strings.TrimPrefix(cfg.AuthPK, "0x")); e == nil {
+				authSigner = k
+			}
+		}
+		results := eip7702.SendPrivate(ctx, "0x"+common.Bytes2Hex(raw), relays, nil, authSigner)
+		accepted := false
+		for _, rr := range results {
+			fmt.Fprintf(logw, "[row %d] relay=%s http=%d accepted=%v body=%s\n",
+				i+1, rr.RelayURL, rr.HTTPStatus, rr.Accepted, rr.ResponseBody)
+			if rr.Accepted {
+				accepted = true
+			}
+		}
+		if !accepted {
+			fmt.Fprintf(logw, "[row %d] no relay accepted\n", i+1)
+		}
+	}
+
+	fmt.Fprintf(logw, "# batch finished at %s\n", time.Now().Format(time.RFC3339))
+	fmt.Printf("Batch log written to %s\n", logPath)
+	return nil
+}
+
+// preflightSellV2GetAmountsOut checks if Uniswap V2 path [token -> WETH] yields non-zero out.
+// It uses router.getAmountsOut(amountIn, path) via eth_call; no approvals are required.
+func preflightSellV2GetAmountsOut(ctx context.Context, ec *ethclient.Client, token common.Address, amountIn *big.Int) (bool, string) {
+	// Mainnet constants (match delegate)
+	router := common.HexToAddress("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
+	weth   := common.HexToAddress("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
+	if amountIn == nil || amountIn.Sign() == 0 {
+		return false, "zero amount"
+	}
+	// Ensure router code exists
+	code, err := ec.CodeAt(ctx, router, nil)
+	if err != nil || len(code) == 0 {
+		return false, "router code not found"
+	}
+	const routerABI = `[{"type":"function","name":"getAmountsOut","stateMutability":"view","inputs":[{"name":"amountIn","type":"uint256"},{"name":"path","type":"address[]"}],"outputs":[{"type":"uint256[]"}]}]`
+	parser, err := abi.JSON(strings.NewReader(routerABI))
+	if err != nil {
+		return false, "ABI parse failed"
+	}
+	path := []common.Address{token, weth}
+	data, err := parser.Pack("getAmountsOut", amountIn, path)
+	if err != nil {
+		return false, "ABI pack failed"
+	}
+	msg := ethereum.CallMsg{To: &router, Data: data}
+	ret, callErr := ec.CallContract(ctx, msg, nil)
+  if callErr != nil {
+      return false, "getAmountsOut revert/no pool"
+  }
+	out, err := parser.Unpack("getAmountsOut", ret)
+	if err != nil || len(out) != 1 {
+		return false, "unexpected return"
+	}
+	amts, ok := out[0].([]*big.Int)
+	if !ok || len(amts) != 2 {
+		return false, "bad amounts array"
+	}
+  if amts[1] == nil || amts[1].Sign() == 0 {
+      return false, "amountOut==0"
+  }
+	return true, ""
 }
 
 // runClassicBundleFromRescueMenu builds core.Params similar to the classic REPL and calls core.Run().
